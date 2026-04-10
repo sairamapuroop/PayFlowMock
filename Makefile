@@ -1,6 +1,6 @@
 # PayFlowMock — local development
-# Default DATABASE_URL matches `.env` / `.env.example` (Compose postgres credentials)
-export DATABASE_URL ?= postgres://payflow:payflow_dev_password@127.0.0.1:5432/PayFlowMock?sslmode=disable
+# Do not export DATABASE_URL here: `cmd/server` calls godotenv.Load(), which does not override
+# existing environment variables. Exporting DATABASE_URL in Make would ignore `.env` for `make run`.
 
 MIGRATE        ?= migrate
 MIGRATIONS_PATH = migrations

@@ -39,7 +39,7 @@ A mock payment middleware service: a small HTTP API backed by PostgreSQL for cre
 Example (or use a `.env` file next to the binary):
 
 ```bash
-export DATABASE_URL='postgres://payflow:payflow_dev_password@127.0.0.1:5432/PayFlowMock?sslmode=disable'
+export DATABASE_URL='postgres://payflow:payflow_dev_password@127.0.0.1:5432/DBName?sslmode=disable'
 export PORT=8080
 go run ./cmd/server
 ```
