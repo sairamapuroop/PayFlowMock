@@ -1,0 +1,40 @@
+# PayFlowMock — local development
+# Default DATABASE_URL matches docker-compose.yml (service: postgres)
+export DATABASE_URL ?= postgres://admin21:admin21@127.0.0.1:5432/PayFlowMock?sslmode=disable
+
+MIGRATE        ?= migrate
+MIGRATIONS_PATH = migrations
+BINARY         = bin/server
+
+.PHONY: help up down migrate-up migrate-down run test build clean install-migrate
+
+help: ## List targets
+	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-18s\033[0m %s\n", $$1, $$2}'
+
+up: ## Start PostgreSQL (docker compose)
+	docker compose up -d
+
+down: ## Stop PostgreSQL
+	docker compose down
+
+migrate-up: ## Apply all migrations (requires golang-migrate CLI)
+	$(MIGRATE) -path $(MIGRATIONS_PATH) -database "$(DATABASE_URL)" up
+
+migrate-down: ## Roll back the last migration
+	$(MIGRATE) -path $(MIGRATIONS_PATH) -database "$(DATABASE_URL)" down 1
+
+run: ## Run the API server
+	go run ./cmd/server
+
+test: ## Run all tests
+	go test -race -count=1 ./...
+
+build: ## Build server binary to bin/server
+	@mkdir -p $(dir $(BINARY))
+	go build -o $(BINARY) ./cmd/server
+
+clean: ## Remove build artifacts
+	rm -rf bin/
+
+install-migrate: ## Install golang-migrate CLI with postgres support
+	go install -tags 'postgres' github.com/golang-migrate/migrate/v4/cmd/migrate@latest
