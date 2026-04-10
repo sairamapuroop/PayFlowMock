@@ -16,8 +16,9 @@ import (
 	"github.com/golang-migrate/migrate/v4"
 	pgxmigrate "github.com/golang-migrate/migrate/v4/database/pgx/v5"
 	_ "github.com/golang-migrate/migrate/v4/source/file"
-	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/jackc/pgx/v5/pgxpool"
+	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/joho/godotenv"
 	"github.com/rs/zerolog/log"
 
 	"github.com/sairamapuroop/PayFlowMock/internal/handler"
@@ -28,6 +29,8 @@ import (
 
 func main() {
 	logger.Setup("payflow")
+
+	_ = godotenv.Load()
 
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {

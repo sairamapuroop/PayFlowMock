@@ -1,6 +1,6 @@
 # PayFlowMock — local development
-# Default DATABASE_URL matches docker-compose.yml (service: postgres)
-export DATABASE_URL ?= postgres://admin21:admin21@127.0.0.1:5432/PayFlowMock?sslmode=disable
+# Default DATABASE_URL matches `.env` / `.env.example` (Compose postgres credentials)
+export DATABASE_URL ?= postgres://payflow:payflow_dev_password@127.0.0.1:5432/PayFlowMock?sslmode=disable
 
 MIGRATE        ?= migrate
 MIGRATIONS_PATH = migrations
@@ -18,10 +18,14 @@ down: ## Stop PostgreSQL
 	docker compose down
 
 migrate-up: ## Apply all migrations (requires golang-migrate CLI)
-	$(MIGRATE) -path $(MIGRATIONS_PATH) -database "$(DATABASE_URL)" up
+	@export DATABASE_URL="$(DATABASE_URL)"; \
+	set -a && [ -f .env ] && . ./.env; set +a && \
+	$(MIGRATE) -path $(MIGRATIONS_PATH) -database "$$DATABASE_URL" up
 
 migrate-down: ## Roll back the last migration
-	$(MIGRATE) -path $(MIGRATIONS_PATH) -database "$(DATABASE_URL)" down 1
+	@export DATABASE_URL="$(DATABASE_URL)"; \
+	set -a && [ -f .env ] && . ./.env; set +a && \
+	$(MIGRATE) -path $(MIGRATIONS_PATH) -database "$$DATABASE_URL" down 1
 
 run: ## Run the API server
 	go run ./cmd/server

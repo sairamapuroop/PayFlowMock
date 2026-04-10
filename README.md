@@ -9,13 +9,15 @@ A mock payment middleware service: a small HTTP API backed by PostgreSQL for cre
 
 ## Quick start
 
-1. **Start PostgreSQL** (credentials match the default `DATABASE_URL` in the Makefile):
+1. **Configure secrets**: copy `.env.example` to `.env` and set `POSTGRES_*`, `DATABASE_URL`, and optionally `API_KEY`.
+
+2. **Start PostgreSQL** (Compose reads `POSTGRES_*` from `.env`):
 
    ```bash
    make up
    ```
 
-2. **Run the server** (migrations run automatically on startup):
+3. **Run the server** (loads `.env` via [godotenv](https://github.com/joho/godotenv); migrations run on startup):
 
    ```bash
    make run
@@ -27,14 +29,17 @@ A mock payment middleware service: a small HTTP API backed by PostgreSQL for cre
 
 | Variable           | Description                                      | Default                                      |
 | ------------------ | ------------------------------------------------ | -------------------------------------------- |
-| `DATABASE_URL`     | PostgreSQL connection string (**required**)      | _(none — set explicitly or use Makefile)_    |
+| `DATABASE_URL`     | PostgreSQL connection string (**required**)      | _(none — use `.env` or export)_             |
+| `API_KEY`          | If set, `/v1/*` requires `X-API-Key` or `Authorization: Bearer` | _(empty — no API key check)_     |
 | `PORT`             | HTTP listen port                                 | `8080`                                       |
 | `MIGRATIONS_PATH`  | Directory containing SQL migration files         | `./migrations` relative to process cwd       |
 
-Example:
+`POSTGRES_USER`, `POSTGRES_PASSWORD`, and `POSTGRES_DB` in `.env` are used by Docker Compose for the `postgres` service; `DATABASE_URL` must match those credentials when connecting from the host.
+
+Example (or use a `.env` file next to the binary):
 
 ```bash
-export DATABASE_URL='postgres://admin21:admin21@127.0.0.1:5432/PayFlowMock?sslmode=disable'
+export DATABASE_URL='postgres://payflow:payflow_dev_password@127.0.0.1:5432/PayFlowMock?sslmode=disable'
 export PORT=8080
 go run ./cmd/server
 ```
