@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/big"
@@ -14,15 +15,111 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/sairamapuroop/PayFlowMock/internal/domain"
+	"github.com/sairamapuroop/PayFlowMock/internal/merchant"
 )
 
 // NewPaymentRepo returns a repository backed by the given pool.
-func NewPaymentRepo(db *pgxpool.Pool) *PaymentRepo {
-	return &PaymentRepo{db: db}
+// outbox and registry are used to enqueue webhook rows in the same transaction as payment updates;
+// outbox must be non-nil for status/refund mutators that emit events.
+func NewPaymentRepo(db *pgxpool.Pool, outbox *OutboxRepo, registry merchant.Registry) *PaymentRepo {
+	return &PaymentRepo{db: db, outbox: outbox, registry: registry}
 }
 
 type PaymentRepo struct {
-	db *pgxpool.Pool
+	db       *pgxpool.Pool
+	outbox   *OutboxRepo
+	registry merchant.Registry
+}
+
+type outboxWebhookEnvelope struct {
+	ID        string            `json:"id"`
+	Type      string            `json:"type"`
+	CreatedAt string            `json:"created_at"`
+	Data      outboxWebhookData `json:"data"`
+}
+
+type outboxWebhookData struct {
+	PaymentID      string `json:"payment_id"`
+	MerchantID     string `json:"merchant_id"`
+	Amount         int64  `json:"amount"`
+	Currency       string `json:"currency"`
+	Status         string `json:"status"`
+	PSP            string `json:"psp,omitempty"`
+	PSPReferenceID string `json:"psp_reference_id,omitempty"`
+	FailureReason  string `json:"failure_reason,omitempty"`
+	RefundID       string `json:"refund_id,omitempty"`
+	RefundAmount   int64  `json:"refund_amount,omitempty"`
+}
+
+func (r *PaymentRepo) webhookURLForMerchant(merchantID uuid.UUID) string {
+	if r == nil || r.registry == nil {
+		return ""
+	}
+	u, ok := r.registry.WebhookURL(merchantID)
+	if !ok {
+		return ""
+	}
+	return u
+}
+
+func marshalOutboxPayload(eventID uuid.UUID, eventType string, createdAt time.Time, data outboxWebhookData) ([]byte, error) {
+	env := outboxWebhookEnvelope{
+		ID:        eventID.String(),
+		Type:      eventType,
+		CreatedAt: createdAt.UTC().Format(time.RFC3339),
+		Data:      data,
+	}
+	return json.Marshal(env)
+}
+
+func (r *PaymentRepo) enqueueOutboxPaymentEventTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	eventType string,
+	paymentID, merchantID uuid.UUID,
+	amount int64,
+	currency string,
+	status domain.Status,
+	pspName, pspReferenceID, failureReason string,
+	refundID uuid.UUID,
+	refundAmount int64,
+	withRefund bool,
+	createdAt time.Time,
+) error {
+	if r == nil || r.outbox == nil {
+		return ErrRepositoryNotConfigured
+	}
+	eventID, err := domain.NewID()
+	if err != nil {
+		return fmt.Errorf("new outbox event id: %w", err)
+	}
+	data := outboxWebhookData{
+		PaymentID:      paymentID.String(),
+		MerchantID:     merchantID.String(),
+		Amount:         amount,
+		Currency:       currency,
+		Status:         string(status),
+		PSP:            pspName,
+		PSPReferenceID: pspReferenceID,
+		FailureReason:  failureReason,
+	}
+	if withRefund {
+		data.RefundID = refundID.String()
+		data.RefundAmount = refundAmount
+	}
+	payload, err := marshalOutboxPayload(eventID, eventType, createdAt, data)
+	if err != nil {
+		return fmt.Errorf("marshal outbox payload: %w", err)
+	}
+	ev := &domain.OutboxEvent{
+		ID:         eventID,
+		PaymentID:  paymentID,
+		MerchantID: merchantID,
+		EventType:  eventType,
+		WebhookURL: r.webhookURLForMerchant(merchantID),
+		Payload:    payload,
+	}
+	return r.outbox.EnqueueTx(ctx, tx, ev)
 }
 
 func isUniqueViolation(err error) bool {
@@ -288,24 +385,123 @@ func (r *PaymentRepo) UpdatePaymentStatusWithPSP(ctx context.Context, id uuid.UU
 		return fmt.Errorf("%w: cannot go from %q to %q", ErrInvalidStatusTransition, fromStatus, toStatus)
 	}
 
-	tag, err := r.db.Exec(ctx, `
+	tx, err := r.db.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("update payment status with psp: begin tx: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+
+	row := tx.QueryRow(ctx, `
 		UPDATE payments
 		SET status = $1, psp = $2, psp_reference_id = $3, updated_at = NOW()
-		WHERE id = $4 AND status = $5`,
+		WHERE id = $4 AND status = $5
+		RETURNING merchant_id, amount, currency`,
 		toStatus, strOrNil(pspName), strOrNil(pspReferenceID), id, fromStatus,
 	)
-	if err != nil {
-		return fmt.Errorf("update payment status with psp: %w", err)
-	}
-	if tag.RowsAffected() == 0 {
-		row := r.db.QueryRow(ctx, `SELECT status FROM payments WHERE id = $1`, id)
-		var current domain.Status
-		if err := row.Scan(&current); errors.Is(err, pgx.ErrNoRows) {
-			return ErrNotFound
-		} else if err != nil {
-			return fmt.Errorf("update payment status with psp: resolve row: %w", err)
+	var merchantID uuid.UUID
+	var amount int64
+	var currency string
+	scanErr := row.Scan(&merchantID, &amount, &currency)
+	if scanErr != nil {
+		if errors.Is(scanErr, pgx.ErrNoRows) {
+			var current domain.Status
+			qErr := tx.QueryRow(ctx, `SELECT status FROM payments WHERE id = $1`, id).Scan(&current)
+			if errors.Is(qErr, pgx.ErrNoRows) {
+				err = ErrNotFound
+				return err
+			}
+			if qErr != nil {
+				err = fmt.Errorf("update payment status with psp: resolve row: %w", qErr)
+				return err
+			}
+			err = fmt.Errorf("%w (current %q, expected %q)", ErrStatusMismatch, current, fromStatus)
+			return err
 		}
-		return fmt.Errorf("%w (current %q, expected %q)", ErrStatusMismatch, current, fromStatus)
+		err = fmt.Errorf("update payment status with psp: %w", scanErr)
+		return err
+	}
+
+	createdAt := time.Now().UTC()
+	if err = r.enqueueOutboxPaymentEventTx(ctx, tx, domain.EventPaymentSuccess, id, merchantID, amount, currency, toStatus, pspName, pspReferenceID, "", uuid.Nil, 0, false, createdAt); err != nil {
+		return err
+	}
+
+	if err = tx.Commit(ctx); err != nil {
+		return fmt.Errorf("update payment status with psp: commit: %w", err)
+	}
+	return nil
+}
+
+// UpdatePaymentFailed transitions to failed and stores PSP fields (optional) and failure_reason.
+func (r *PaymentRepo) UpdatePaymentFailed(ctx context.Context, id uuid.UUID, fromStatus domain.Status, pspName, pspReferenceID, failureReason string) error {
+	if r == nil || r.db == nil {
+		return ErrRepositoryNotConfigured
+	}
+	if id == uuid.Nil {
+		return fmt.Errorf("%w: id is required", ErrInvalidPayment)
+	}
+	toStatus := domain.StatusFailed
+	if !domain.IsKnownStatus(fromStatus) || !domain.IsKnownStatus(toStatus) {
+		return fmt.Errorf("%w: unknown status", ErrInvalidStatusTransition)
+	}
+	if fromStatus == toStatus {
+		return nil
+	}
+	if !domain.ValidTransition(fromStatus, toStatus) {
+		return fmt.Errorf("%w: cannot go from %q to %q", ErrInvalidStatusTransition, fromStatus, toStatus)
+	}
+
+	tx, err := r.db.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("update payment failed: begin tx: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+
+	row := tx.QueryRow(ctx, `
+		UPDATE payments
+		SET status = $1, psp = $2, psp_reference_id = $3, failure_reason = $4, updated_at = NOW()
+		WHERE id = $5 AND status = $6
+		RETURNING merchant_id, amount, currency`,
+		toStatus, strOrNil(pspName), strOrNil(pspReferenceID), strOrNil(failureReason), id, fromStatus,
+	)
+	var merchantID uuid.UUID
+	var amount int64
+	var currency string
+	scanErr := row.Scan(&merchantID, &amount, &currency)
+	if scanErr != nil {
+		if errors.Is(scanErr, pgx.ErrNoRows) {
+			var current domain.Status
+			qErr := tx.QueryRow(ctx, `SELECT status FROM payments WHERE id = $1`, id).Scan(&current)
+			if errors.Is(qErr, pgx.ErrNoRows) {
+				err = ErrNotFound
+				return err
+			}
+			if qErr != nil {
+				err = fmt.Errorf("update payment failed: resolve row: %w", qErr)
+				return err
+			}
+			err = fmt.Errorf("%w (current %q, expected %q)", ErrStatusMismatch, current, fromStatus)
+			return err
+		}
+		err = fmt.Errorf("update payment failed: %w", scanErr)
+		return err
+	}
+
+	createdAt := time.Now().UTC()
+	if err = r.enqueueOutboxPaymentEventTx(ctx, tx, domain.EventPaymentFailed, id, merchantID, amount, currency, toStatus, pspName, pspReferenceID, failureReason, uuid.Nil, 0, false, createdAt); err != nil {
+		return err
+	}
+
+	if err = tx.Commit(ctx); err != nil {
+		return fmt.Errorf("update payment failed: commit: %w", err)
 	}
 	return nil
 }
@@ -352,17 +548,37 @@ func (r *PaymentRepo) RefundPaymentAtomic(ctx context.Context, paymentID uuid.UU
 		return uuid.Nil, fmt.Errorf("insert refund: %w", err)
 	}
 
-	tag, err := tx.Exec(ctx, `
+	row := tx.QueryRow(ctx, `
 		UPDATE payments
 		SET status = $1, updated_at = NOW()
-		WHERE id = $2 AND status = $3`,
+		WHERE id = $2 AND status = $3
+		RETURNING merchant_id, amount, currency, psp, psp_reference_id`,
 		domain.StatusRefunded, paymentID, domain.StatusSuccess,
 	)
-	if err != nil {
-		return uuid.Nil, fmt.Errorf("update payment to refunded: %w", err)
+	var merchantID uuid.UUID
+	var amount int64
+	var currency string
+	var pspName, pspReferenceID sql.NullString
+	scanErr := row.Scan(&merchantID, &amount, &currency, &pspName, &pspReferenceID)
+	if scanErr != nil {
+		if errors.Is(scanErr, pgx.ErrNoRows) {
+			err = ErrStatusMismatch
+			return uuid.Nil, err
+		}
+		return uuid.Nil, fmt.Errorf("update payment to refunded: %w", scanErr)
 	}
-	if tag.RowsAffected() == 0 {
-		err = ErrStatusMismatch
+
+	pspN := ""
+	pspRef := ""
+	if pspName.Valid {
+		pspN = pspName.String
+	}
+	if pspReferenceID.Valid {
+		pspRef = pspReferenceID.String
+	}
+
+	createdAt := time.Now().UTC()
+	if err = r.enqueueOutboxPaymentEventTx(ctx, tx, domain.EventPaymentRefunded, paymentID, merchantID, amount, currency, domain.StatusRefunded, pspN, pspRef, "", refundID, refundAmount, true, createdAt); err != nil {
 		return uuid.Nil, err
 	}
 

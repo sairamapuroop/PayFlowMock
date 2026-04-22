@@ -6,16 +6,30 @@ MIGRATE        ?= migrate
 MIGRATIONS_PATH = migrations
 BINARY         = bin/server
 
-.PHONY: help up down migrate-up migrate-down run test build clean install-migrate
+WEBHOOK_SINK_PORT ?= 9999
+
+.PHONY: help up down postgres-up postgres-down redis-up redis-down migrate-up migrate-down run test build clean install-migrate webhook-sink
 
 help: ## List targets
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-18s\033[0m %s\n", $$1, $$2}'
 
-up: ## Start PostgreSQL (docker compose)
-	docker compose up -d
+up: ## Start PostgreSQL and Redis (docker compose)
+	docker compose up -d postgres redis
 
-down: ## Stop PostgreSQL
+down: ## Stop and remove PostgreSQL and Redis containers (docker compose)
 	docker compose down
+
+postgres-up: ## Start PostgreSQL only
+	docker compose up -d postgres
+
+postgres-down: ## Stop PostgreSQL only (container kept)
+	docker compose stop postgres
+
+redis-up: ## Start Redis only
+	docker compose up -d redis
+
+redis-down: ## Stop Redis only (container kept)
+	docker compose stop redis
 
 migrate-up: ## Apply all migrations (requires golang-migrate CLI)
 	@export DATABASE_URL="$(DATABASE_URL)"; \
@@ -42,3 +56,6 @@ clean: ## Remove build artifacts
 
 install-migrate: ## Install golang-migrate CLI with postgres support
 	go install -tags 'postgres' github.com/golang-migrate/migrate/v4/cmd/migrate@latest
+
+webhook-sink: ## Local echo server for webhook manual testing (port via WEBHOOK_SINK_PORT, default 9999)
+	WEBHOOK_SINK_PORT=$(WEBHOOK_SINK_PORT) python3 scripts/webhook_sink.py

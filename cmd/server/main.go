@@ -9,6 +9,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -21,9 +23,14 @@ import (
 	"github.com/joho/godotenv"
 	"github.com/rs/zerolog/log"
 
+	"github.com/sairamapuroop/PayFlowMock/internal/cache"
 	"github.com/sairamapuroop/PayFlowMock/internal/handler"
+	"github.com/sairamapuroop/PayFlowMock/internal/merchant"
+	"github.com/sairamapuroop/PayFlowMock/internal/middleware"
+	"github.com/sairamapuroop/PayFlowMock/internal/psp"
 	"github.com/sairamapuroop/PayFlowMock/internal/repository"
 	"github.com/sairamapuroop/PayFlowMock/internal/service"
+	"github.com/sairamapuroop/PayFlowMock/internal/worker"
 	"github.com/sairamapuroop/PayFlowMock/pkg/logger"
 )
 
@@ -75,11 +82,38 @@ func main() {
 		log.Fatal().Err(err).Msg("ping database")
 	}
 
-	repo := repository.NewPaymentRepo(pool)
-	svc := service.NewPaymentService(repo)
+	redisClient := cache.NewFromEnv()
+	defer func() {
+		if err := redisClient.Close(); err != nil {
+			log.Error().Err(err).Msg("close redis client")
+		}
+	}()
+	if err := redisClient.Ping(ctx); err != nil {
+		log.Fatal().Err(err).Msg("ping redis")
+	}
+
+	outboxRepo := repository.NewOutboxRepo(pool)
+	registry := merchant.NewEnvRegistry(os.Getenv)
+	repo := repository.NewPaymentRepo(pool, outboxRepo, registry)
+	stripeMock := psp.NewStripeMock(psp.DefaultStripeMockConfig())
+	razorpayMock := psp.NewRazorpayMock(psp.DefaultRazorpayMockConfig())
+	stripeAdapter := psp.NewCircuitBreakerAdapter(stripeMock)
+	razorpayAdapter := psp.NewCircuitBreakerAdapter(razorpayMock)
+	router := psp.DefaultRouter(stripeAdapter, razorpayAdapter)
+	svc := service.NewPaymentService(repo, router)
 	h := handler.NewPaymentHandler(svc, pool)
 
+	idempotency := middleware.NewIdempotency(redisClient.Redis(), pool)
+	if v := strings.TrimSpace(os.Getenv("IDEMPOTENCY_REQUEST_TIMEOUT")); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			log.Fatal().Err(err).Str("IDEMPOTENCY_REQUEST_TIMEOUT", v).Msg("invalid IDEMPOTENCY_REQUEST_TIMEOUT")
+		}
+		idempotency.SetRequestTimeout(d)
+	}
+
 	r := chi.NewRouter()
+	r.Use(idempotency.Middleware)
 	h.Register(r)
 
 	addr := ":" + port
@@ -92,6 +126,23 @@ func main() {
 	shutdownCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	whCfg := worker.DefaultConfig()
+	if v := strings.TrimSpace(os.Getenv("WEBHOOK_POLL_INTERVAL")); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			log.Fatal().Err(err).Str("WEBHOOK_POLL_INTERVAL", v).Msg("invalid WEBHOOK_POLL_INTERVAL")
+		}
+		whCfg.PollInterval = d
+	}
+	webhookWorker := worker.New(outboxRepo, registry, whCfg)
+
+	var workerWg sync.WaitGroup
+	workerWg.Add(1)
+	go func() {
+		defer workerWg.Done()
+		webhookWorker.Run(shutdownCtx)
+	}()
+
 	go func() {
 		log.Info().Str("addr", addr).Msg("http server listening")
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -101,6 +152,8 @@ func main() {
 
 	<-shutdownCtx.Done()
 	log.Info().Msg("shutting down")
+
+	workerWg.Wait()
 
 	cancelCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()

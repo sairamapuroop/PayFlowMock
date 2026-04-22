@@ -8,10 +8,10 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/sairamapuroop/PayFlowMock/internal/domain"
+	"github.com/sairamapuroop/PayFlowMock/internal/psp"
 	"github.com/sairamapuroop/PayFlowMock/internal/repository"
+	"github.com/sairamapuroop/PayFlowMock/internal/retry"
 )
-
-const stubPSPName = "stub"
 
 // PaymentRepository is the persistence contract for payment flows (implemented by *repository.PaymentRepo).
 type PaymentRepository interface {
@@ -19,6 +19,7 @@ type PaymentRepository interface {
 	GetPaymentByID(ctx context.Context, id uuid.UUID) (*domain.Payment, error)
 	UpdatePaymentStatus(ctx context.Context, id uuid.UUID, fromStatus, toStatus domain.Status) error
 	UpdatePaymentStatusWithPSP(ctx context.Context, id uuid.UUID, fromStatus, toStatus domain.Status, pspName, pspReferenceID string) error
+	UpdatePaymentFailed(ctx context.Context, id uuid.UUID, fromStatus domain.Status, pspName, pspReferenceID, failureReason string) error
 	RefundPaymentAtomic(ctx context.Context, paymentID uuid.UUID, refundAmount int64, idempotencyKey string) (refundID uuid.UUID, err error)
 }
 
@@ -31,15 +32,21 @@ type PaymentServiceAPI interface {
 
 // PaymentService handles payment use cases.
 type PaymentService struct {
-	repo PaymentRepository
+	repo     PaymentRepository
+	router   *psp.Router
+	retryCfg retry.Config
 }
 
-// NewPaymentService returns a service backed by repo.
-func NewPaymentService(repo PaymentRepository) *PaymentService {
-	if repo == nil {
+// NewPaymentService returns a service backed by repo and the PSP router (retry + circuit breaker live on adapters).
+func NewPaymentService(repo PaymentRepository, router *psp.Router) *PaymentService {
+	if repo == nil || router == nil {
 		return nil
 	}
-	return &PaymentService{repo: repo}
+	return &PaymentService{
+		repo:     repo,
+		router:   router,
+		retryCfg: retry.DefaultConfig(),
+	}
 }
 
 var (
@@ -47,9 +54,9 @@ var (
 	ErrValidation = errors.New("validation error")
 )
 
-// CreatePayment validates input, persists a new payment, and runs the Week-1 stub PSP flow to SUCCESS.
+// CreatePayment validates input, persists a new payment, routes to a PSP, charges with retries, and updates status.
 func (s *PaymentService) CreatePayment(ctx context.Context, req domain.CreatePaymentRequest) (*domain.CreatePaymentResponse, error) {
-	if s == nil || s.repo == nil {
+	if s == nil || s.repo == nil || s.router == nil {
 		return nil, errors.New("payment service is not configured")
 	}
 	if err := validateCreatePaymentRequest(&req); err != nil {
@@ -61,6 +68,7 @@ func (s *PaymentService) CreatePayment(ctx context.Context, req domain.CreatePay
 		return nil, fmt.Errorf("generate payment id: %w", err)
 	}
 
+	amountInt64 := req.Amount.Int64()
 	payment := &domain.Payment{
 		ID:             id,
 		MerchantID:     req.MerchantID,
@@ -78,15 +86,76 @@ func (s *PaymentService) CreatePayment(ctx context.Context, req domain.CreatePay
 		return nil, err
 	}
 
-	stubRef := fmt.Sprintf("%s-%s", stubPSPName, id.String())
-	if err := s.repo.UpdatePaymentStatusWithPSP(ctx, id, domain.StatusProcessing, domain.StatusSuccess, stubPSPName, stubRef); err != nil {
-		return nil, err
+	adapter, routeErr := s.router.Select(payment.Currency, amountInt64)
+	if routeErr != nil {
+		reason := routeErr.Error()
+		if err := s.repo.UpdatePaymentFailed(ctx, id, domain.StatusProcessing, "", "", reason); err != nil {
+			return nil, err
+		}
+		return &domain.CreatePaymentResponse{PaymentID: id, Status: domain.StatusFailed}, nil
 	}
 
-	return &domain.CreatePaymentResponse{
-		PaymentID: id,
-		Status:    domain.StatusSuccess,
-	}, nil
+	pspName := adapter.Name()
+	chargeReq := psp.ChargeRequest{
+		PaymentID:      id,
+		Amount:         amountInt64,
+		Currency:       payment.Currency,
+		IdempotencyKey: payment.IdempotencyKey,
+	}
+
+	resp, chargeErr := retry.Do(ctx, s.retryCfg, func() (*psp.ChargeResponse, error) {
+		return adapter.Charge(ctx, chargeReq)
+	})
+	if chargeErr != nil {
+		if err := s.repo.UpdatePaymentFailed(ctx, id, domain.StatusProcessing, pspName, "", formatChargeFailureReason(chargeErr)); err != nil {
+			return nil, err
+		}
+		return &domain.CreatePaymentResponse{PaymentID: id, Status: domain.StatusFailed}, nil
+	}
+
+	switch resp.Status {
+	case psp.ChargeStatusCaptured, psp.ChargeStatusAuthorized:
+		if err := s.repo.UpdatePaymentStatusWithPSP(ctx, id, domain.StatusProcessing, domain.StatusSuccess, pspName, resp.PSPReferenceID); err != nil {
+			return nil, err
+		}
+		return &domain.CreatePaymentResponse{PaymentID: id, Status: domain.StatusSuccess}, nil
+	case psp.ChargeStatusDeclined, psp.ChargeStatusError:
+		reason := chargeDeclineReason(resp)
+		if err := s.repo.UpdatePaymentFailed(ctx, id, domain.StatusProcessing, pspName, resp.PSPReferenceID, reason); err != nil {
+			return nil, err
+		}
+		return &domain.CreatePaymentResponse{PaymentID: id, Status: domain.StatusFailed}, nil
+	default:
+		reason := fmt.Sprintf("unexpected_psp_status:%s", resp.Status)
+		if err := s.repo.UpdatePaymentFailed(ctx, id, domain.StatusProcessing, pspName, resp.PSPReferenceID, reason); err != nil {
+			return nil, err
+		}
+		return &domain.CreatePaymentResponse{PaymentID: id, Status: domain.StatusFailed}, nil
+	}
+}
+
+func formatChargeFailureReason(err error) string {
+	if err == nil {
+		return ""
+	}
+	var pe *psp.Error
+	if errors.As(err, &pe) {
+		if pe.Message != "" {
+			return fmt.Sprintf("%s: %s", pe.Code, pe.Message)
+		}
+		return pe.Code
+	}
+	return err.Error()
+}
+
+func chargeDeclineReason(resp *psp.ChargeResponse) string {
+	if resp == nil {
+		return "declined"
+	}
+	if resp.Status == psp.ChargeStatusError {
+		return "charge_error"
+	}
+	return "declined"
 }
 
 // GetPayment returns the persisted payment or ErrNotFound.
