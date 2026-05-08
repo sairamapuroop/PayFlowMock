@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math/big"
 	"strings"
 	"time"
 
@@ -188,7 +187,7 @@ func validatePaymentForCreate(p *domain.Payment) error {
 func scanPayment(row pgx.Row) (*domain.Payment, error) {
 	var (
 		p              domain.Payment
-		amount         big.Int
+		amount         int64
 		psp            sql.NullString
 		pspReferenceID sql.NullString
 		failureReason  sql.NullString
@@ -209,7 +208,7 @@ func scanPayment(row pgx.Row) (*domain.Payment, error) {
 	if err != nil {
 		return nil, err
 	}
-	p.Amount.SetInt64(amount.Int64())
+	p.Amount.SetInt64(amount)
 	if psp.Valid {
 		p.PSP = psp.String
 	}
@@ -316,7 +315,18 @@ func (r *PaymentRepo) UpdatePaymentStatus(ctx context.Context, id uuid.UUID, fro
 	if fromStatus == toStatus {
 		return nil
 	}
-	if !domain.ValidTransition(fromStatus, toStatus) {
+	validTransition := domain.ValidTransition(fromStatus, toStatus)
+	if !validTransition {
+		row := r.db.QueryRow(ctx, `SELECT status FROM payments WHERE id = $1`, id)
+		var current domain.Status
+		if err := row.Scan(&current); errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		} else if err != nil {
+			return fmt.Errorf("update payment status: resolve row in invalid transition: %w", err)
+		}
+		if current != fromStatus {
+			return fmt.Errorf("%w (current %q, expected %q)", ErrStatusMismatch, current, fromStatus)
+		}
 		return fmt.Errorf("%w: cannot go from %q to %q", ErrInvalidStatusTransition, fromStatus, toStatus)
 	}
 

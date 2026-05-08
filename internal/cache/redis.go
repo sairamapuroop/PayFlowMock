@@ -4,7 +4,9 @@ import (
 	"context"
 	"os"
 
+	"github.com/redis/go-redis/extra/redisotel/v9"
 	"github.com/redis/go-redis/v9"
+	"github.com/rs/zerolog/log"
 )
 
 // Client wraps go-redis for connection lifecycle; use Redis() for standard commands.
@@ -14,8 +16,15 @@ type Client struct {
 
 // New returns a Redis client for addr (host:port).
 func New(addr string) *Client {
+	rdb := redis.NewClient(&redis.Options{Addr: addr})
+	if err := redisotel.InstrumentTracing(rdb); err != nil {
+		log.Warn().Err(err).Msg("redis tracing instrumentation failed")
+	}
+	if err := redisotel.InstrumentMetrics(rdb); err != nil {
+		log.Warn().Err(err).Msg("redis metrics instrumentation failed")
+	}
 	return &Client{
-		rdb: redis.NewClient(&redis.Options{Addr: addr}),
+		rdb: rdb,
 	}
 }
 

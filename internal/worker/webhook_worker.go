@@ -21,6 +21,10 @@ import (
 	"github.com/sairamapuroop/PayFlowMock/internal/domain"
 	"github.com/sairamapuroop/PayFlowMock/internal/merchant"
 	"github.com/sairamapuroop/PayFlowMock/internal/repository"
+	"github.com/sairamapuroop/PayFlowMock/pkg/metrics"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 )
 
 // Config controls webhook delivery polling and retry behavior.
@@ -29,12 +33,12 @@ type Config struct {
 	BatchSize    int
 	MaxAttempts  int
 	// WorkerPool bounds concurrent HTTP deliveries per poll tick.
-	WorkerPool int
+	WorkerPool  int
 	HTTPTimeout time.Duration
 	// StaleReclaimMul scales PollInterval to decide when PROCESSING rows are reset (worker crash safety).
-	StaleReclaimMul int
-	BaseDelay       time.Duration
-	MaxBackoff      time.Duration
+	StaleReclaimMul   int
+	BaseDelay         time.Duration
+	MaxBackoff        time.Duration
 	BackoffMultiplier float64
 }
 
@@ -86,14 +90,14 @@ func (c Config) withDefaults() Config {
 
 // Worker drains the transactional outbox by POSTing signed JSON payloads to merchant webhook URLs.
 type Worker struct {
-	outbox    *repository.OutboxRepo
-	registry  merchant.Registry
-	client    *http.Client
-	pollEvery time.Duration
-	batchSize int
+	outbox      *repository.OutboxRepo
+	registry    merchant.Registry
+	client      *http.Client
+	pollEvery   time.Duration
+	batchSize   int
 	maxAttempts int
-	poolSize  int
-	cfg       Config
+	poolSize    int
+	cfg         Config
 }
 
 // New constructs a Worker. registry may be nil (no HMAC signing).
@@ -133,6 +137,12 @@ func (w *Worker) Run(ctx context.Context) {
 }
 
 func (w *Worker) runOnce(ctx context.Context, staleAfter time.Duration) {
+	if pending, err := w.outbox.CountPending(ctx); err != nil {
+		log.Error().Err(err).Msg("outbox pending count")
+	} else {
+		metrics.C().OutboxPending.Set(float64(pending))
+	}
+
 	if _, err := w.outbox.ReclaimStaleProcessing(ctx, staleAfter); err != nil {
 		log.Error().Err(err).Msg("outbox reclaim stale processing")
 	}
@@ -163,6 +173,17 @@ func (w *Worker) runOnce(ctx context.Context, staleAfter time.Duration) {
 
 func (w *Worker) handleOne(ctx context.Context, evt *domain.OutboxEvent) {
 	start := time.Now()
+	tracer := otel.Tracer("payflow/worker")
+	ctx, span := tracer.Start(ctx, "webhook.deliver")
+	span.SetAttributes(
+		attribute.String("event.id", evt.ID.String()),
+		attribute.String("payment.id", evt.PaymentID.String()),
+		attribute.String("merchant.id", evt.MerchantID.String()),
+		attribute.String("event.type", evt.EventType),
+		attribute.Int("event.attempt", evt.AttemptCount+1),
+	)
+	defer span.End()
+
 	zl := log.With().
 		Str("event_id", evt.ID.String()).
 		Str("payment_id", evt.PaymentID.String()).
@@ -175,6 +196,9 @@ func (w *Worker) handleOne(ctx context.Context, evt *domain.OutboxEvent) {
 		if err := w.outbox.MarkDead(ctx, evt.ID, "no_webhook_url_for_merchant"); err != nil {
 			zl.Error().Err(err).Msg("mark dead (no webhook url)")
 		}
+		metrics.C().WebhookDeliveryAttemptsTotal.WithLabelValues("dead").Inc()
+		metrics.C().WebhookDeliveryLatencySeconds.Observe(time.Since(start).Seconds())
+		span.SetStatus(codes.Error, "missing webhook url")
 		return
 	}
 
@@ -187,9 +211,15 @@ func (w *Worker) handleOne(ctx context.Context, evt *domain.OutboxEvent) {
 	if err == nil {
 		if derr := w.outbox.MarkDelivered(ctx, evt.ID); derr != nil {
 			zl.Error().Err(derr).Int("http_status", httpStatus).Int64("latency_ms", latency.Milliseconds()).Msg("mark delivered")
+			metrics.C().WebhookDeliveryAttemptsTotal.WithLabelValues("error").Inc()
+			span.RecordError(derr)
+			span.SetStatus(codes.Error, derr.Error())
 		} else {
 			zl.Info().Int("http_status", httpStatus).Int64("latency_ms", latency.Milliseconds()).Msg("webhook delivered")
+			metrics.C().WebhookDeliveryAttemptsTotal.WithLabelValues("success").Inc()
+			span.SetAttributes(attribute.Int("http.status_code", httpStatus))
 		}
+		metrics.C().WebhookDeliveryLatencySeconds.Observe(latency.Seconds())
 		return
 	}
 
@@ -199,18 +229,33 @@ func (w *Worker) handleOne(ctx context.Context, evt *domain.OutboxEvent) {
 		evtLog = evtLog.Int("http_status", httpStatus)
 	}
 	evtLog.Msg("webhook delivery failed")
+	span.RecordError(err)
+	span.SetStatus(codes.Error, err.Error())
+	span.SetAttributes(attribute.Int("http.status_code", httpStatus))
 
 	if evt.AttemptCount+1 >= w.maxAttempts {
 		if derr := w.outbox.MarkDead(ctx, evt.ID, lastErr); derr != nil {
 			zl.Error().Err(derr).Msg("mark dead")
+			metrics.C().WebhookDeliveryAttemptsTotal.WithLabelValues("error").Inc()
+			span.RecordError(derr)
+			span.SetStatus(codes.Error, derr.Error())
+		} else {
+			metrics.C().WebhookDeliveryAttemptsTotal.WithLabelValues("dead").Inc()
 		}
+		metrics.C().WebhookDeliveryLatencySeconds.Observe(latency.Seconds())
 		return
 	}
 
 	nextAt := time.Now().UTC().Add(w.nextBackoffDelay(evt.AttemptCount))
 	if derr := w.outbox.MarkRetry(ctx, evt.ID, nextAt, lastErr); derr != nil {
 		zl.Error().Err(derr).Time("next_retry_at", nextAt).Msg("mark retry")
+		metrics.C().WebhookDeliveryAttemptsTotal.WithLabelValues("error").Inc()
+		span.RecordError(derr)
+		span.SetStatus(codes.Error, derr.Error())
+	} else {
+		metrics.C().WebhookDeliveryAttemptsTotal.WithLabelValues("retry").Inc()
 	}
+	metrics.C().WebhookDeliveryLatencySeconds.Observe(latency.Seconds())
 }
 
 // nextBackoffDelay applies exponential backoff with full jitter (same formula as internal/retry).

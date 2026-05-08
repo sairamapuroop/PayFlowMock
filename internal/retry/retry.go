@@ -20,6 +20,9 @@ type Config struct {
 	Multiplier  float64
 }
 
+// AttemptObserver receives the outcome label for each failed attempt.
+type AttemptObserver func(outcome string)
+
 // DefaultConfig returns the recommended defaults (3 attempts, 100ms base, 10s cap, 2x growth).
 func DefaultConfig() Config {
 	return Config{
@@ -49,6 +52,11 @@ func (c Config) withDefaults() Config {
 // Do runs op until it succeeds, ctx is cancelled, or non-retryable error / max attempts.
 // Between failures it waits using exponential backoff with full jitter (uniform in [0, min(exp, MaxDelay)]).
 func Do[T any](ctx context.Context, cfg Config, op func() (T, error)) (T, error) {
+	return DoWithObserver(ctx, cfg, op, nil)
+}
+
+// DoWithObserver behaves like Do and reports each failed attempt outcome via observer.
+func DoWithObserver[T any](ctx context.Context, cfg Config, op func() (T, error), observer AttemptObserver) (T, error) {
 	cfg = cfg.withDefaults()
 	var zero T
 	var lastErr error
@@ -64,7 +72,13 @@ func Do[T any](ctx context.Context, cfg Config, op func() (T, error)) (T, error)
 		}
 		lastErr = err
 		if !IsRetryable(err) {
+			if observer != nil {
+				observer("nonretryable_error")
+			}
 			return zero, err
+		}
+		if observer != nil {
+			observer("retryable_error")
 		}
 		if attempt == cfg.MaxAttempts-1 {
 			break

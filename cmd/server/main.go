@@ -14,7 +14,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/exaring/otelpgx"
 	"github.com/go-chi/chi/v5"
+	chimw "github.com/go-chi/chi/v5/middleware"
 	"github.com/golang-migrate/migrate/v4"
 	pgxmigrate "github.com/golang-migrate/migrate/v4/database/pgx/v5"
 	_ "github.com/golang-migrate/migrate/v4/source/file"
@@ -22,6 +24,7 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/joho/godotenv"
 	"github.com/rs/zerolog/log"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
 	"github.com/sairamapuroop/PayFlowMock/internal/cache"
 	"github.com/sairamapuroop/PayFlowMock/internal/handler"
@@ -32,6 +35,8 @@ import (
 	"github.com/sairamapuroop/PayFlowMock/internal/service"
 	"github.com/sairamapuroop/PayFlowMock/internal/worker"
 	"github.com/sairamapuroop/PayFlowMock/pkg/logger"
+	"github.com/sairamapuroop/PayFlowMock/pkg/metrics"
+	"github.com/sairamapuroop/PayFlowMock/pkg/tracer"
 )
 
 func main() {
@@ -68,10 +73,27 @@ func main() {
 	}
 
 	ctx := context.Background()
+	otelServiceName := strings.TrimSpace(os.Getenv("OTEL_SERVICE_NAME"))
+	if otelServiceName == "" {
+		otelServiceName = "payflow"
+	}
+	shutdownTracer, err := tracer.Init(ctx, otelServiceName)
+	if err != nil {
+		log.Fatal().Err(err).Msg("initialize tracer")
+	}
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := shutdownTracer(shutdownCtx); err != nil {
+			log.Error().Err(err).Msg("shutdown tracer")
+		}
+	}()
+
 	poolCfg, err := pgxpool.ParseConfig(databaseURL)
 	if err != nil {
 		log.Fatal().Err(err).Msg("parse DATABASE_URL for pool")
 	}
+	poolCfg.ConnConfig.Tracer = otelpgx.NewTracer()
 	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
 		log.Fatal().Err(err).Msg("create pgx pool")
@@ -113,7 +135,13 @@ func main() {
 	}
 
 	r := chi.NewRouter()
+	r.Use(chimw.RequestID)
+	r.Use(chimw.RealIP)
+	r.Use(otelhttp.NewMiddleware("payflow-http"))
+	r.Use(middleware.Logging)
+	r.Use(middleware.Metrics)
 	r.Use(idempotency.Middleware)
+	r.Handle("/metrics", metrics.Handler())
 	h.Register(r)
 
 	addr := ":" + port

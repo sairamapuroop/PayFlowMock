@@ -124,6 +124,15 @@ RETURNING
 	return out, rows.Err()
 }
 
+// CountPending returns the current number of outbox events waiting for delivery.
+func (r *OutboxRepo) CountPending(ctx context.Context) (int64, error) {
+	var count int64
+	if err := r.db.QueryRow(ctx, `SELECT COUNT(*) FROM outbox_events WHERE status = 'PENDING'`).Scan(&count); err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
 // ReclaimStaleProcessing resets PROCESSING rows whose updated_at is older than staleAfter
 // back to PENDING so they can be claimed again after a worker crash or stalled delivery.
 func (r *OutboxRepo) ReclaimStaleProcessing(ctx context.Context, staleAfter time.Duration) (int64, error) {

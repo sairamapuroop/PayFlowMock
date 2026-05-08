@@ -11,6 +11,10 @@ import (
 	"github.com/sairamapuroop/PayFlowMock/internal/psp"
 	"github.com/sairamapuroop/PayFlowMock/internal/repository"
 	"github.com/sairamapuroop/PayFlowMock/internal/retry"
+	"github.com/sairamapuroop/PayFlowMock/pkg/metrics"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 )
 
 // PaymentRepository is the persistence contract for payment flows (implemented by *repository.PaymentRepo).
@@ -56,15 +60,24 @@ var (
 
 // CreatePayment validates input, persists a new payment, routes to a PSP, charges with retries, and updates status.
 func (s *PaymentService) CreatePayment(ctx context.Context, req domain.CreatePaymentRequest) (*domain.CreatePaymentResponse, error) {
+	tracer := otel.Tracer("payflow/service")
+	ctx, span := tracer.Start(ctx, "payment.create")
+	defer span.End()
+
 	if s == nil || s.repo == nil || s.router == nil {
+		span.SetStatus(codes.Error, "payment service is not configured")
 		return nil, errors.New("payment service is not configured")
 	}
 	if err := validateCreatePaymentRequest(&req); err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		return nil, err
 	}
 
 	id, err := domain.NewID()
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		return nil, fmt.Errorf("generate payment id: %w", err)
 	}
 
@@ -77,12 +90,22 @@ func (s *PaymentService) CreatePayment(ctx context.Context, req domain.CreatePay
 		Status:         domain.StatusInitiated,
 		IdempotencyKey: strings.TrimSpace(req.IdempotencyKey),
 	}
+	span.SetAttributes(
+		attribute.String("payment.id", id.String()),
+		attribute.String("merchant.id", req.MerchantID.String()),
+		attribute.Int64("payment.amount", amountInt64),
+		attribute.String("payment.currency", payment.Currency),
+	)
 
 	if err := s.repo.CreatePayment(ctx, payment); err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		return nil, err
 	}
 
 	if err := s.repo.UpdatePaymentStatus(ctx, id, domain.StatusInitiated, domain.StatusProcessing); err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		return nil, err
 	}
 
@@ -90,8 +113,12 @@ func (s *PaymentService) CreatePayment(ctx context.Context, req domain.CreatePay
 	if routeErr != nil {
 		reason := routeErr.Error()
 		if err := s.repo.UpdatePaymentFailed(ctx, id, domain.StatusProcessing, "", "", reason); err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
 			return nil, err
 		}
+		metrics.C().PaymentsTotal.WithLabelValues(string(domain.StatusFailed)).Inc()
+		span.SetAttributes(attribute.String("payment.status", string(domain.StatusFailed)))
 		return &domain.CreatePaymentResponse{PaymentID: id, Status: domain.StatusFailed}, nil
 	}
 
@@ -103,33 +130,51 @@ func (s *PaymentService) CreatePayment(ctx context.Context, req domain.CreatePay
 		IdempotencyKey: payment.IdempotencyKey,
 	}
 
-	resp, chargeErr := retry.Do(ctx, s.retryCfg, func() (*psp.ChargeResponse, error) {
+	resp, chargeErr := retry.DoWithObserver(ctx, s.retryCfg, func() (*psp.ChargeResponse, error) {
 		return adapter.Charge(ctx, chargeReq)
+	}, func(outcome string) {
+		metrics.C().PSPRetryAttemptsTotal.WithLabelValues(outcome).Inc()
 	})
 	if chargeErr != nil {
 		if err := s.repo.UpdatePaymentFailed(ctx, id, domain.StatusProcessing, pspName, "", formatChargeFailureReason(chargeErr)); err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
 			return nil, err
 		}
+		metrics.C().PaymentsTotal.WithLabelValues(string(domain.StatusFailed)).Inc()
+		span.SetAttributes(attribute.String("payment.status", string(domain.StatusFailed)))
 		return &domain.CreatePaymentResponse{PaymentID: id, Status: domain.StatusFailed}, nil
 	}
 
 	switch resp.Status {
 	case psp.ChargeStatusCaptured, psp.ChargeStatusAuthorized:
 		if err := s.repo.UpdatePaymentStatusWithPSP(ctx, id, domain.StatusProcessing, domain.StatusSuccess, pspName, resp.PSPReferenceID); err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
 			return nil, err
 		}
+		metrics.C().PaymentsTotal.WithLabelValues(string(domain.StatusSuccess)).Inc()
+		span.SetAttributes(attribute.String("payment.status", string(domain.StatusSuccess)))
 		return &domain.CreatePaymentResponse{PaymentID: id, Status: domain.StatusSuccess}, nil
 	case psp.ChargeStatusDeclined, psp.ChargeStatusError:
 		reason := chargeDeclineReason(resp)
 		if err := s.repo.UpdatePaymentFailed(ctx, id, domain.StatusProcessing, pspName, resp.PSPReferenceID, reason); err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
 			return nil, err
 		}
+		metrics.C().PaymentsTotal.WithLabelValues(string(domain.StatusFailed)).Inc()
+		span.SetAttributes(attribute.String("payment.status", string(domain.StatusFailed)))
 		return &domain.CreatePaymentResponse{PaymentID: id, Status: domain.StatusFailed}, nil
 	default:
 		reason := fmt.Sprintf("unexpected_psp_status:%s", resp.Status)
 		if err := s.repo.UpdatePaymentFailed(ctx, id, domain.StatusProcessing, pspName, resp.PSPReferenceID, reason); err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
 			return nil, err
 		}
+		metrics.C().PaymentsTotal.WithLabelValues(string(domain.StatusFailed)).Inc()
+		span.SetAttributes(attribute.String("payment.status", string(domain.StatusFailed)))
 		return &domain.CreatePaymentResponse{PaymentID: id, Status: domain.StatusFailed}, nil
 	}
 }
@@ -171,21 +216,37 @@ func (s *PaymentService) GetPayment(ctx context.Context, id uuid.UUID) (*domain.
 
 // RefundPayment refunds a successful payment up to its original amount inside one DB transaction.
 func (s *PaymentService) RefundPayment(ctx context.Context, paymentID uuid.UUID, req domain.RefundRequest) (*domain.RefundResponse, error) {
+	tracer := otel.Tracer("payflow/service")
+	ctx, span := tracer.Start(ctx, "payment.refund")
+	defer span.End()
+
 	if s == nil || s.repo == nil {
+		span.SetStatus(codes.Error, "payment service is not configured")
 		return nil, errors.New("payment service is not configured")
 	}
 	if paymentID == uuid.Nil {
+		span.SetStatus(codes.Error, "payment id is required")
 		return nil, fmt.Errorf("%w: payment id is required", ErrValidation)
 	}
 	if req.PaymentID != uuid.Nil && req.PaymentID != paymentID {
+		span.SetStatus(codes.Error, "payment_id does not match path")
 		return nil, fmt.Errorf("%w: payment_id does not match path", ErrValidation)
 	}
 	if err := validateRefundRequest(&req); err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		return nil, err
 	}
+	span.SetAttributes(
+		attribute.String("payment.id", paymentID.String()),
+		attribute.String("payment.currency", strings.ToUpper(strings.TrimSpace(req.Currency))),
+		attribute.Int64("refund.amount", req.Amount.Int64()),
+	)
 
 	p, err := s.repo.GetPaymentByID(ctx, paymentID)
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		return nil, err
 	}
 	if p.Status != domain.StatusSuccess {
@@ -207,10 +268,16 @@ func (s *PaymentService) RefundPayment(ctx context.Context, paymentID uuid.UUID,
 	refundID, err := s.repo.RefundPaymentAtomic(ctx, paymentID, req.Amount.Int64(), strings.TrimSpace(req.IdempotencyKey))
 	if err != nil {
 		if errors.Is(err, repository.ErrStatusMismatch) {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
 			return nil, fmt.Errorf("payment is not in %q (concurrent update?): %w", domain.StatusSuccess, err)
 		}
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		return nil, err
 	}
+	metrics.C().PaymentsTotal.WithLabelValues(string(domain.StatusRefunded)).Inc()
+	span.SetAttributes(attribute.String("payment.status", string(domain.StatusRefunded)))
 
 	return &domain.RefundResponse{
 		RefundID: refundID,
@@ -272,6 +339,6 @@ func validateRefundRequest(req *domain.RefundRequest) error {
 
 // Compile-time checks.
 var (
-	_ PaymentRepository  = (*repository.PaymentRepo)(nil)
-	_ PaymentServiceAPI  = (*PaymentService)(nil)
+	_ PaymentRepository = (*repository.PaymentRepo)(nil)
+	_ PaymentServiceAPI = (*PaymentService)(nil)
 )
