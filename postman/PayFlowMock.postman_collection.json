@@ -2,7 +2,7 @@
   "info": {
     "_postman_id": "a1b2c3d4-payflow-mock-api",
     "name": "PayFlowMock API",
-    "description": "HTTP tests for PayFlowMock — payments, refunds, health, metrics, and webhook-shaped requests (see repo `README.md`).\n\n**Base URL:** default `http://127.0.0.1:8080` (`PORT` in docker-compose).\n\n**Outbound webhooks:** Success/failure/refund events are queued to Postgres and delivered by the worker (`WEBHOOK_POLL_INTERVAL`, default ~5s). Configure `DEFAULT_WEBHOOK_URL` or `MERCHANT_WEBHOOK_URLS`, optionally `WEBHOOK_SIGNING_SECRET`. Run `python3 scripts/webhook_sink.py` and point `DEFAULT_WEBHOOK_URL=http://127.0.0.1:9999/webhook`, then create or refund a payment and watch the sink logs.\n\n**HTTP idempotency:** Send `Idempotency-Key` (or `X-Idempotency-Key`) on `POST` to enable Redis/Postgres-backed deduplication. Omit the header to skip middleware.\n\n**Optional auth:** If the server enforces `API_KEY`, set collection variable `apiKey` and enable the **Authorization** folder requests (or add `X-API-Key` yourself).",
+    "description": "HTTP tests for PayFlowMock — payments, refunds, health, metrics, HTTP idempotency, and webhook-shaped requests (see repo `README.md`).\n\n**Base URL:** default `http://127.0.0.1:8080`.\n\n**Payment flow:** USD/EUR/GBP charges use `stripe_mock`; INR charges use `razorpay_mock`. A refund is an atomic local PostgreSQL transition for a successful payment and emits a `payment.refunded` event; the current HTTP refund flow does not invoke a PSP refund adapter.\n\n**Outbound webhooks:** Success/failure/refund events are queued to PostgreSQL and delivered by the worker. Configure `DEFAULT_WEBHOOK_URL` or `MERCHANT_WEBHOOK_URLS`, and optionally `WEBHOOK_SIGNING_SECRET`. For a host-run API, run `make webhook-sink` and use `http://127.0.0.1:9999/webhook`. For the Compose app, use a receiver reachable from the container, such as `http://host.docker.internal:9999/webhook` on Docker Desktop.\n\n**HTTP idempotency:** Send `Idempotency-Key` (or `X-Idempotency-Key`) on mutating requests to cache and replay the full response. Reusing a key with a different body, path, or method returns `409`. The request body still requires its own `idempotency_key`.\n\n**Authentication:** The current server does not enforce `API_KEY`; no API-key header is needed.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "variable": [
@@ -10,10 +10,10 @@
     { "key": "merchant_id", "value": "550e8400-e29b-41d4-a716-446655440000" },
     { "key": "payment_id", "value": "" },
     { "key": "refund_id", "value": "" },
-    { "key": "apiKey", "value": "" },
     { "key": "webhookReceiverUrl", "value": "http://127.0.0.1:9999/webhook" },
     { "key": "webhook_signing_secret", "value": "" },
-    { "key": "fixed_idempotency_key", "value": "postman-fixed-idem-001" }
+    { "key": "fixed_idempotency_key", "value": "postman-fixed-idem-001" },
+    { "key": "idempotency_response_body", "value": "" }
   ],
   "auth": {
     "type": "noauth"
@@ -24,6 +24,18 @@
       "item": [
         {
           "name": "GET /healthz",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Health check returns 200', function () { pm.response.to.have.status(200); });",
+                  "pm.test('Health check reports ok', function () { pm.expect(pm.response.json()).to.deep.equal({ status: 'ok' }); });"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
           "request": {
             "method": "GET",
             "header": [],
@@ -34,6 +46,18 @@
         },
         {
           "name": "GET /metrics",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Metrics endpoint returns 200', function () { pm.response.to.have.status(200); });",
+                  "pm.test('Metrics include HTTP counter', function () { pm.expect(pm.response.text()).to.include('payflow_http_requests_total'); });"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
           "request": {
             "method": "GET",
             "header": [],
@@ -60,8 +84,11 @@
                   "    if (j.payment_id) { pm.collectionVariables.set('payment_id', j.payment_id); }",
                   "  } catch (e) {}",
                   "}",
-                  "pm.test('Status is 201 or 4xx/5xx as expected', function () {",
-                  "  pm.expect(pm.response.code).to.be.oneOf([201, 400, 409, 500]);",
+                  "pm.test('Payment creation returns 201', function () { pm.response.to.have.status(201); });",
+                  "pm.test('Payment response has an ID and terminal status', function () {",
+                  "  const j = pm.response.json();",
+                  "  pm.expect(j.payment_id).to.be.a('string').and.not.empty;",
+                  "  pm.expect(j.status).to.be.oneOf(['success', 'failed']);",
                   "});"
                 ],
                 "type": "text/javascript"
@@ -85,6 +112,20 @@
         },
         {
           "name": "POST /v1/payments (INR → razorpay_mock)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('INR payment creation returns 201', function () { pm.response.to.have.status(201); });",
+                  "const j = pm.response.json();",
+                  "if (j.payment_id) { pm.collectionVariables.set('payment_id', j.payment_id); }",
+                  "pm.test('INR payment response has a terminal status', function () { pm.expect(j.status).to.be.oneOf(['success', 'failed']); });"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
           "request": {
             "method": "POST",
             "header": [
@@ -102,6 +143,18 @@
         },
         {
           "name": "GET /v1/payments/{id}",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Payment lookup returns 200', function () { pm.response.to.have.status(200); });",
+                  "pm.test('Payment detail exposes amount as a decimal string', function () { pm.expect(pm.response.json().amount).to.be.a('string'); });"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
           "request": {
             "method": "GET",
             "header": [],
@@ -112,6 +165,18 @@
         },
         {
           "name": "POST /v1/payments — invalid JSON",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Invalid JSON returns 400', function () { pm.response.to.have.status(400); });",
+                  "pm.test('Invalid JSON has the expected error code', function () { pm.expect(pm.response.json().error.code).to.equal('INVALID_JSON'); });"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
           "request": {
             "method": "POST",
             "header": [
@@ -128,6 +193,18 @@
         },
         {
           "name": "POST /v1/payments — invalid currency",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Invalid currency returns 400', function () { pm.response.to.have.status(400); });",
+                  "pm.test('Invalid currency has a validation error', function () { pm.expect(pm.response.json().error.code).to.equal('VALIDATION_ERROR'); });"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
           "request": {
             "method": "POST",
             "header": [
@@ -160,7 +237,9 @@
                   "    const j = pm.response.json();",
                   "    if (j.refund_id) { pm.collectionVariables.set('refund_id', j.refund_id); }",
                   "  } catch (e) {}",
-                  "}"
+                  "}",
+                  "pm.test('Refund returns 200', function () { pm.response.to.have.status(200); });",
+                  "pm.test('Refund response reports success', function () { pm.expect(pm.response.json().status).to.equal('success'); });"
                 ],
                 "type": "text/javascript"
               }
@@ -177,7 +256,7 @@
               "raw": "{\n  \"amount\": 100,\n  \"currency\": \"USD\",\n  \"idempotency_key\": \"refund-{{$guid}}\"\n}"
             },
             "url": "{{baseUrl}}/v1/payments/{{payment_id}}/refund",
-            "description": "Refunds a **successful** payment. Adjust `amount`/`currency` to match the payment row. Emits `payment.refunded` webhook when configured."
+            "description": "Refunds a **successful** payment. Adjust `amount`/`currency` to match the payment row. This performs the local atomic refund transition and emits `payment.refunded` when webhooks are configured."
           },
           "response": []
         }
@@ -188,6 +267,25 @@
       "item": [
         {
           "name": "POST /v1/payments — same Idempotency-Key (run twice)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Idempotent create returns 201', function () { pm.response.to.have.status(201); });",
+                  "const body = pm.response.text();",
+                  "const previous = pm.collectionVariables.get('idempotency_response_body');",
+                  "if (previous) {",
+                  "  pm.test('Second response replays the first response', function () { pm.expect(body).to.equal(previous); });",
+                  "} else {",
+                  "  pm.collectionVariables.set('idempotency_response_body', body);",
+                  "}",
+                  "pm.test('Idempotency response contains a payment ID', function () { pm.expect(pm.response.json().payment_id).to.be.a('string').and.not.empty; });"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
           "request": {
             "method": "POST",
             "header": [
@@ -199,7 +297,36 @@
               "raw": "{\n  \"merchant_id\": \"{{merchant_id}}\",\n  \"amount\": 200,\n  \"currency\": \"USD\",\n  \"idempotency_key\": \"idem-body-{{fixed_idempotency_key}}\"\n}"
             },
             "url": "{{baseUrl}}/v1/payments",
-            "description": "Send **twice** with the same header and body. Second response should replay the first (same status/body). Change body or `fixed_idempotency_key` between runs for conflict tests."
+            "description": "Send this request twice with the same header and body. The second response should replay the first. Clear `idempotency_response_body` and use a new `fixed_idempotency_key` to begin a new replay check."
+          },
+          "response": []
+        },
+        {
+          "name": "POST /v1/payments — idempotency conflict (run after replay request)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Reusing a key with a different body returns 409', function () { pm.response.to.have.status(409); });",
+                  "pm.test('Conflict reports an idempotency error', function () { pm.expect(pm.response.json().error.code).to.equal('IDEMPOTENCY_ERROR'); });"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Idempotency-Key", "value": "{{fixed_idempotency_key}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"merchant_id\": \"{{merchant_id}}\",\n  \"amount\": 201,\n  \"currency\": \"USD\",\n  \"idempotency_key\": \"idem-body-conflict-{{fixed_idempotency_key}}\"\n}"
+            },
+            "url": "{{baseUrl}}/v1/payments",
+            "description": "Run after the same-key replay request. The header key matches but the body differs, so the middleware must return `409 IDEMPOTENCY_ERROR`."
           },
           "response": []
         }
@@ -240,7 +367,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"id\": \"11111111-1111-1111-1111-111111111111\",\n  \"type\": \"payment.success\",\n  \"created_at\": \"2026-05-11T12:00:00Z\",\n  \"data\": {\n    \"payment_id\": \"{{payment_id}}\",\n    \"merchant_id\": \"{{merchant_id}}\",\n    \"amount\": 100,\n    \"currency\": \"USD\",\n    \"status\": \"success\",\n    \"psp\": \"stripe_mock\",\n    \"psp_reference_id\": \"pi_example\"\n  }\n}"
+              "raw": "{\n  \"id\": \"11111111-1111-1111-1111-111111111111\",\n  \"type\": \"payment.success\",\n  \"created_at\": \"2026-05-11T12:00:00Z\",\n  \"data\": {\n    \"payment_id\": \"{{payment_id}}\",\n    \"merchant_id\": \"{{merchant_id}}\",\n    \"amount\": 100,\n    \"currency\": \"USD\",\n    \"status\": \"success\",\n    \"psp\": \"stripe_mock\",\n    \"psp_reference_id\": \"ch_example\"\n  }\n}"
             },
             "url": "{{webhookReceiverUrl}}",
             "description": "Posts the same JSON **envelope** shape the webhook worker sends (see `marshalOutboxPayload` / `outboxWebhookEnvelope`). Point `webhookReceiverUrl` at `webhook_sink.py` or webhook.site. Set `webhook_signing_secret` to match `WEBHOOK_SIGNING_SECRET` to send a valid `X-PayFlow-Signature` header."
@@ -278,36 +405,10 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"id\": \"22222222-2222-2222-2222-222222222222\",\n  \"type\": \"payment.refunded\",\n  \"created_at\": \"2026-05-11T12:01:00Z\",\n  \"data\": {\n    \"payment_id\": \"{{payment_id}}\",\n    \"merchant_id\": \"{{merchant_id}}\",\n    \"amount\": 100,\n    \"currency\": \"USD\",\n    \"status\": \"refunded\",\n    \"psp\": \"stripe_mock\",\n    \"psp_reference_id\": \"pi_example\",\n    \"refund_id\": \"{{refund_id}}\",\n    \"refund_amount\": 100\n  }\n}"
+              "raw": "{\n  \"id\": \"22222222-2222-2222-2222-222222222222\",\n  \"type\": \"payment.refunded\",\n  \"created_at\": \"2026-05-11T12:01:00Z\",\n  \"data\": {\n    \"payment_id\": \"{{payment_id}}\",\n    \"merchant_id\": \"{{merchant_id}}\",\n    \"amount\": 100,\n    \"currency\": \"USD\",\n    \"status\": \"refunded\",\n    \"psp\": \"stripe_mock\",\n    \"psp_reference_id\": \"ch_example\",\n    \"refund_id\": \"{{refund_id}}\",\n    \"refund_amount\": 100\n  }\n}"
             },
             "url": "{{webhookReceiverUrl}}",
             "description": "Sample refund webhook payload (after a refund, `refund_id` / amounts come from the real event)."
-          },
-          "response": []
-        }
-      ]
-    },
-    {
-      "name": "Optional API key",
-      "item": [
-        {
-          "name": "POST /v1/payments (with X-API-Key)",
-          "request": {
-            "auth": {
-              "type": "noauth"
-            },
-            "method": "POST",
-            "header": [
-              { "key": "Content-Type", "value": "application/json" },
-              { "key": "X-API-Key", "value": "{{apiKey}}" },
-              { "key": "Idempotency-Key", "value": "{{$guid}}" }
-            ],
-            "body": {
-              "mode": "raw",
-              "raw": "{\n  \"merchant_id\": \"{{merchant_id}}\",\n  \"amount\": 100,\n  \"currency\": \"EUR\",\n  \"idempotency_key\": \"pay-apikey-{{$guid}}\"\n}"
-            },
-            "url": "{{baseUrl}}/v1/payments",
-            "description": "Use when the server is configured with `API_KEY` (see README). Populate `apiKey` first; if auth is not enabled, requests still work."
           },
           "response": []
         }
