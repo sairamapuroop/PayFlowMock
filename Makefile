@@ -8,7 +8,7 @@ BINARY         = bin/server
 
 WEBHOOK_SINK_PORT ?= 9999
 
-.PHONY: help up down postgres-up postgres-down redis-up redis-down migrate-up migrate-down run test test-unit test-integration test-week2-unit test-week2-integration test-week3-unit test-week3-integration build clean install-migrate webhook-sink stack-up stack-down logs docker-build
+.PHONY: help up down postgres-up postgres-down redis-up redis-down migrate-up migrate-down run test test-unit test-integration test-week2-unit test-week2-integration test-week3-unit test-week3-integration build clean install-migrate webhook-sink stack-up stack-down logs docker-build vendor
 
 help: ## List targets
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-24s\033[0m %s\n", $$1, $$2}'
@@ -19,7 +19,7 @@ up: ## Start PostgreSQL and Redis (docker compose)
 down: ## Stop and remove PostgreSQL and Redis containers (docker compose)
 	docker compose down
 
-stack-up: ## Full stack: Postgres, Redis, app, Jaeger, Prometheus, Grafana (requires `.env`; cp .env.example .env first)
+stack-up: ## Full stack: Postgres, Redis, app, Jaeger, Prometheus, Loki, Alloy, Grafana (requires `.env`; cp .env.example .env first)
 	@test -f .env || (echo >&2 "Missing .env — run: cp .env.example .env"; exit 1)
 	docker compose up -d --build
 
@@ -29,8 +29,11 @@ stack-down: ## Stop full stack (all compose services)
 logs: ## Follow logs — optional SERVICES="app grafana" (default: all services)
 	docker compose logs -f $(SERVICES)
 
-docker-build: ## Build the app image only
+docker-build: ## Build the app image only (uses vendored modules; run `make vendor` after dependency changes)
 	docker compose build app
+
+vendor: ## Refresh vendor/ for reproducible Docker builds without fetching modules over TLS
+	go mod vendor
 
 postgres-up: ## Start PostgreSQL only
 	docker compose up -d postgres

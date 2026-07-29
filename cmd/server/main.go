@@ -60,7 +60,13 @@ func main() {
 		if err != nil {
 			log.Fatal().Err(err).Msg("get working directory")
 		}
-		migrationsDir = filepath.Join(wd, "migrations")
+		// Align with Makefile `migrate -path migrations/up` and internal/testutil when split layout exists.
+		up := filepath.Join(wd, "migrations", "up")
+		if st, err := os.Stat(up); err == nil && st.IsDir() {
+			migrationsDir = up
+		} else {
+			migrationsDir = filepath.Join(wd, "migrations")
+		}
 	}
 
 	migrationsURL, err := migrationsFileURL(migrationsDir)

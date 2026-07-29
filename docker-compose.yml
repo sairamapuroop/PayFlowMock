@@ -53,6 +53,35 @@ services:
     volumes:
       - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
 
+  loki:
+    image: grafana/loki:3.2.1
+    container_name: payflowmock-loki
+    command:
+      - -config.file=/etc/loki/loki.yml
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./deploy/loki/loki.yml:/etc/loki/loki.yml:ro
+      - loki_data:/loki
+
+  alloy:
+    image: grafana/alloy:v1.4.3
+    container_name: payflowmock-alloy
+    command:
+      - run
+      - --server.http.listen-addr=0.0.0.0:12345
+      - --storage.path=/var/lib/alloy/data
+      - /etc/alloy/config.alloy
+    ports:
+      - "12345:12345"
+    volumes:
+      - ./deploy/alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - alloy_data:/var/lib/alloy/data
+    depends_on:
+      loki:
+        condition: service_started
+
   grafana:
     image: grafana/grafana:11.2.0
     container_name: payflowmock-grafana
@@ -66,6 +95,11 @@ services:
     volumes:
       - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
       - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      prometheus:
+        condition: service_started
+      loki:
+        condition: service_started
   app:
     build:
       context: .
@@ -92,3 +126,5 @@ services:
 volumes:
   postgres_data:
   redis_data:
+  loki_data:
+  alloy_data:

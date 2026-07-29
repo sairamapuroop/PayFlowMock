@@ -1,0 +1,317 @@
+{
+  "info": {
+    "_postman_id": "a1b2c3d4-payflow-mock-api",
+    "name": "PayFlowMock API",
+    "description": "HTTP tests for PayFlowMock — payments, refunds, health, metrics, and webhook-shaped requests (see repo `README.md`).\n\n**Base URL:** default `http://127.0.0.1:8080` (`PORT` in docker-compose).\n\n**Outbound webhooks:** Success/failure/refund events are queued to Postgres and delivered by the worker (`WEBHOOK_POLL_INTERVAL`, default ~5s). Configure `DEFAULT_WEBHOOK_URL` or `MERCHANT_WEBHOOK_URLS`, optionally `WEBHOOK_SIGNING_SECRET`. Run `python3 scripts/webhook_sink.py` and point `DEFAULT_WEBHOOK_URL=http://127.0.0.1:9999/webhook`, then create or refund a payment and watch the sink logs.\n\n**HTTP idempotency:** Send `Idempotency-Key` (or `X-Idempotency-Key`) on `POST` to enable Redis/Postgres-backed deduplication. Omit the header to skip middleware.\n\n**Optional auth:** If the server enforces `API_KEY`, set collection variable `apiKey` and enable the **Authorization** folder requests (or add `X-API-Key` yourself).",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "baseUrl", "value": "http://127.0.0.1:8080" },
+    { "key": "merchant_id", "value": "550e8400-e29b-41d4-a716-446655440000" },
+    { "key": "payment_id", "value": "" },
+    { "key": "refund_id", "value": "" },
+    { "key": "apiKey", "value": "" },
+    { "key": "webhookReceiverUrl", "value": "http://127.0.0.1:9999/webhook" },
+    { "key": "webhook_signing_secret", "value": "" },
+    { "key": "fixed_idempotency_key", "value": "postman-fixed-idem-001" }
+  ],
+  "auth": {
+    "type": "noauth"
+  },
+  "item": [
+    {
+      "name": "Health & metrics",
+      "item": [
+        {
+          "name": "GET /healthz",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/healthz",
+            "description": "Liveness; pings Postgres. Expect `{\"status\":\"ok\"}` when DB is up."
+          },
+          "response": []
+        },
+        {
+          "name": "GET /metrics",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/metrics",
+            "description": "Prometheus scrape endpoint (text format)."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Payments",
+      "item": [
+        {
+          "name": "POST /v1/payments (USD → stripe_mock)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "if (pm.response.code === 201) {",
+                  "  try {",
+                  "    const j = pm.response.json();",
+                  "    if (j.payment_id) { pm.collectionVariables.set('payment_id', j.payment_id); }",
+                  "  } catch (e) {}",
+                  "}",
+                  "pm.test('Status is 201 or 4xx/5xx as expected', function () {",
+                  "  pm.expect(pm.response.code).to.be.oneOf([201, 400, 409, 500]);",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Idempotency-Key", "value": "{{$guid}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"merchant_id\": \"{{merchant_id}}\",\n  \"amount\": 100,\n  \"currency\": \"USD\",\n  \"idempotency_key\": \"pay-{{$guid}}\"\n}"
+            },
+            "url": "{{baseUrl}}/v1/payments",
+            "description": "Creates a payment. USD routes to Stripe mock. Response includes `payment_id` and `status`; tests save `payment_id` to the collection variable."
+          },
+          "response": []
+        },
+        {
+          "name": "POST /v1/payments (INR → razorpay_mock)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Idempotency-Key", "value": "{{$guid}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"merchant_id\": \"{{merchant_id}}\",\n  \"amount\": 10000,\n  \"currency\": \"INR\",\n  \"idempotency_key\": \"pay-inr-{{$guid}}\"\n}"
+            },
+            "url": "{{baseUrl}}/v1/payments",
+            "description": "INR routes to Razorpay mock."
+          },
+          "response": []
+        },
+        {
+          "name": "GET /v1/payments/{id}",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/v1/payments/{{payment_id}}",
+            "description": "Fetch payment detail (`amount` is a decimal string). Set `payment_id` via Create payment or paste a UUID."
+          },
+          "response": []
+        },
+        {
+          "name": "POST /v1/payments — invalid JSON",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "not-json"
+            },
+            "url": "{{baseUrl}}/v1/payments",
+            "description": "Expect 400 `INVALID_JSON`."
+          },
+          "response": []
+        },
+        {
+          "name": "POST /v1/payments — invalid currency",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Idempotency-Key", "value": "{{$guid}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"merchant_id\": \"{{merchant_id}}\",\n  \"amount\": 100,\n  \"currency\": \"XYZ\",\n  \"idempotency_key\": \"pay-bad-curr-{{$guid}}\"\n}"
+            },
+            "url": "{{baseUrl}}/v1/payments",
+            "description": "Expect 400 validation error (supported: USD, EUR, GBP, INR)."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Refunds",
+      "item": [
+        {
+          "name": "POST /v1/payments/{id}/refund",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "if (pm.response.code === 200) {",
+                  "  try {",
+                  "    const j = pm.response.json();",
+                  "    if (j.refund_id) { pm.collectionVariables.set('refund_id', j.refund_id); }",
+                  "  } catch (e) {}",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Idempotency-Key", "value": "{{$guid}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"amount\": 100,\n  \"currency\": \"USD\",\n  \"idempotency_key\": \"refund-{{$guid}}\"\n}"
+            },
+            "url": "{{baseUrl}}/v1/payments/{{payment_id}}/refund",
+            "description": "Refunds a **successful** payment. Adjust `amount`/`currency` to match the payment row. Emits `payment.refunded` webhook when configured."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "HTTP idempotency",
+      "item": [
+        {
+          "name": "POST /v1/payments — same Idempotency-Key (run twice)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Idempotency-Key", "value": "{{fixed_idempotency_key}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"merchant_id\": \"{{merchant_id}}\",\n  \"amount\": 200,\n  \"currency\": \"USD\",\n  \"idempotency_key\": \"idem-body-{{fixed_idempotency_key}}\"\n}"
+            },
+            "url": "{{baseUrl}}/v1/payments",
+            "description": "Send **twice** with the same header and body. Second response should replay the first (same status/body). Change body or `fixed_idempotency_key` between runs for conflict tests."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Webhook (simulate receiver)",
+      "item": [
+        {
+          "name": "POST sample payment.success envelope",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "exec": [
+                  "// Matches worker: HMAC-SHA256(secret, raw body) hex → sha256=<hex>",
+                  "const secret = pm.collectionVariables.get('webhook_signing_secret');",
+                  "if (secret) {",
+                  "  const raw = pm.request.body.raw;",
+                  "  const hash = CryptoJS.HmacSHA256(raw, CryptoJS.enc.Utf8.parse(secret));",
+                  "  const sig = 'sha256=' + CryptoJS.enc.Hex.stringify(hash);",
+                  "  pm.request.headers.upsert({ key: 'X-PayFlow-Signature', value: sig });",
+                  "} else {",
+                  "  pm.request.headers.remove('X-PayFlow-Signature');",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-PayFlow-Event-Id", "value": "11111111-1111-1111-1111-111111111111" },
+              { "key": "X-PayFlow-Event-Type", "value": "payment.success" },
+              { "key": "Idempotency-Key", "value": "11111111-1111-1111-1111-111111111111" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"id\": \"11111111-1111-1111-1111-111111111111\",\n  \"type\": \"payment.success\",\n  \"created_at\": \"2026-05-11T12:00:00Z\",\n  \"data\": {\n    \"payment_id\": \"{{payment_id}}\",\n    \"merchant_id\": \"{{merchant_id}}\",\n    \"amount\": 100,\n    \"currency\": \"USD\",\n    \"status\": \"success\",\n    \"psp\": \"stripe_mock\",\n    \"psp_reference_id\": \"pi_example\"\n  }\n}"
+            },
+            "url": "{{webhookReceiverUrl}}",
+            "description": "Posts the same JSON **envelope** shape the webhook worker sends (see `marshalOutboxPayload` / `outboxWebhookEnvelope`). Point `webhookReceiverUrl` at `webhook_sink.py` or webhook.site. Set `webhook_signing_secret` to match `WEBHOOK_SIGNING_SECRET` to send a valid `X-PayFlow-Signature` header."
+          },
+          "response": []
+        },
+        {
+          "name": "POST sample payment.refunded envelope",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "exec": [
+                  "const secret = pm.collectionVariables.get('webhook_signing_secret');",
+                  "if (secret) {",
+                  "  const raw = pm.request.body.raw;",
+                  "  const hash = CryptoJS.HmacSHA256(raw, CryptoJS.enc.Utf8.parse(secret));",
+                  "  const sig = 'sha256=' + CryptoJS.enc.Hex.stringify(hash);",
+                  "  pm.request.headers.upsert({ key: 'X-PayFlow-Signature', value: sig });",
+                  "} else {",
+                  "  pm.request.headers.remove('X-PayFlow-Signature');",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-PayFlow-Event-Id", "value": "22222222-2222-2222-2222-222222222222" },
+              { "key": "X-PayFlow-Event-Type", "value": "payment.refunded" },
+              { "key": "Idempotency-Key", "value": "22222222-2222-2222-2222-222222222222" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"id\": \"22222222-2222-2222-2222-222222222222\",\n  \"type\": \"payment.refunded\",\n  \"created_at\": \"2026-05-11T12:01:00Z\",\n  \"data\": {\n    \"payment_id\": \"{{payment_id}}\",\n    \"merchant_id\": \"{{merchant_id}}\",\n    \"amount\": 100,\n    \"currency\": \"USD\",\n    \"status\": \"refunded\",\n    \"psp\": \"stripe_mock\",\n    \"psp_reference_id\": \"pi_example\",\n    \"refund_id\": \"{{refund_id}}\",\n    \"refund_amount\": 100\n  }\n}"
+            },
+            "url": "{{webhookReceiverUrl}}",
+            "description": "Sample refund webhook payload (after a refund, `refund_id` / amounts come from the real event)."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Optional API key",
+      "item": [
+        {
+          "name": "POST /v1/payments (with X-API-Key)",
+          "request": {
+            "auth": {
+              "type": "noauth"
+            },
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-API-Key", "value": "{{apiKey}}" },
+              { "key": "Idempotency-Key", "value": "{{$guid}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"merchant_id\": \"{{merchant_id}}\",\n  \"amount\": 100,\n  \"currency\": \"EUR\",\n  \"idempotency_key\": \"pay-apikey-{{$guid}}\"\n}"
+            },
+            "url": "{{baseUrl}}/v1/payments",
+            "description": "Use when the server is configured with `API_KEY` (see README). Populate `apiKey` first; if auth is not enabled, requests still work."
+          },
+          "response": []
+        }
+      ]
+    }
+  ]
+}

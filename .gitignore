@@ -1,0 +1,38 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor / IDE
+.idea/
+*.swp
+*.swo
+*~
+
+# Go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+coverage.out
+*.coverprofile
+vendor/
+
+# Built binaries (common local output dirs)
+/bin/
+/dist/
+/tmp/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+
+# Docker (optional local overrides)
+docker-compose.override.yml
+.dockerignore
