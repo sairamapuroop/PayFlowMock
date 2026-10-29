@@ -1,180 +1,197 @@
 # PayFlowMock
 
-PayFlowMock is a Go payment-orchestration demo. It exposes a small HTTP API, routes payment charges to bundled Stripe- and Razorpay-like PSP mocks, retries transient PSP errors, protects providers with circuit breakers, persists payment state in PostgreSQL, and uses Redis/PostgreSQL-backed HTTP idempotency. Payment state changes also create transactional outbox events that a worker delivers to merchant webhooks.
+PayFlowMock is a Go application for tests of payment integrations. It provides an HTTP API and local payment service provider (PSP) mocks.
+PostgreSQL stores payment records. Redis stores cached responses and request locks. A background worker sends payment events to merchant webhooks.
 
-The project is designed for exercising payment integrations and observability patterns without calling real PSPs.
+The application uses Stripe and Razorpay mocks. It does not send payments to real providers.
 
-## Implemented behavior
+> Writing target: approximately 80% alignment with [ASD-STE100 Simplified Technical English](https://www.asd-ste100.org/).
+> This README uses short sentences, active voice, and direct instructions. Technical names and code retain their original form.
+> The percentage is a style target, not a measured compliance score.
 
-- Supported currencies: `USD`, `EUR`, `GBP`, and `INR`.
-- Default routing: `INR` → `razorpay_mock`; `USD`, `EUR`, and `GBP` → `stripe_mock`.
-- Charges use three attempts with exponential backoff and full jitter for retryable failures.
-- Each mock PSP has an independent circuit breaker: five consecutive failures open it, and it probes up to three requests after a 30-second timeout.
-- Refunds currently validate the payment and perform the refund row insert plus `success` → `refunded` payment transition atomically in PostgreSQL. The PSP refund adapter methods are available for extension but are not invoked by the current HTTP refund service.
-- Successful, failed, and refunded transitions enqueue `payment.success`, `payment.failed`, or `payment.refunded` events in the same database transaction.
-- Payment IDs and outbox event IDs use UUID v7.
-- The server emits structured JSON logs, Prometheus metrics, and OpenTelemetry traces.
+## Features
+
+- Create payments in `USD`, `EUR`, `GBP`, or `INR`.
+- Send `INR` charges to `razorpay_mock`.
+- Send `USD`, `EUR`, and `GBP` charges to `stripe_mock`.
+- Make up to three charge attempts for temporary PSP errors.
+- Increase the retry delay exponentially and add a random delay (full jitter).
+- Protect each PSP with a separate circuit breaker.
+- Store payment changes and webhook events in the same database transaction.
+- Replay stored HTTP responses when a client repeats an idempotency key.
+- Export JSON logs, Prometheus metrics, and OpenTelemetry traces.
+
+Five consecutive failures open a circuit breaker. After 30 seconds, the circuit breaker permits up to three probe requests.
+Payment IDs and outbox event IDs use UUID v7.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-    Client --> HTTP["chi router<br/>OTel HTTP + logging + metrics"]
-    HTTP --> Idem["Idempotency middleware"]
-    Idem --> Svc["Payment service"]
-    Svc --> Repo["pgx repository"]
-    Svc --> PSP["PSP adapters<br/>retry + circuit breaker"]
-    Repo --> PG[(PostgreSQL)]
-    Repo --> Outbox[(outbox_events)]
-    Worker["Webhook worker"] --> Outbox
-    Worker --> Merchant["Merchant URL"]
-
-    subgraph observability [Observability]
-      Prom[(Prometheus)]
-      Graf[Grafana]
-      Jaeger[Jaeger]
-      Loki[(Loki)]
-      Alloy["Grafana Alloy"]
-    end
-    HTTP -. scrape .-> Prom
-    HTTP -. OTLP/HTTP .-> Jaeger
-    Alloy -. Docker logs .-> Loki
-    Prom --> Graf
-    Loki --> Graf
+    Client --> HTTP[HTTP API]
+    HTTP --> Idem[Idempotency middleware]
+    Idem --> Service[Payment service]
+    Service --> PSP[PSP mocks: retry and circuit breaker]
+    Service --> Repo[Repository]
+    Repo --> DB[(PostgreSQL: payments and outbox)]
+    Idem --> Redis[(Redis)]
+    Worker[Webhook worker] --> DB
+    Worker --> Merchant[Merchant webhook]
+    HTTP -. metrics .-> Prometheus
+    HTTP -. traces .-> Jaeger
+    Alloy[Grafana Alloy] -. Docker logs .-> Loki
+    Prometheus --> Grafana
+    Loki --> Grafana
 ```
 
-## Quickstart
+## Start the full stack
 
-Requirements: Docker with Compose and Go 1.25.4 or newer (`go.mod`). Go is only needed for host-side development and tests; the Compose app is built in Docker.
+Install Docker with Compose. Install Make to use the commands below.
+Go is necessary only for development and tests on the host. The module requires Go 1.25.4 or later.
 
-1. Create local configuration:
+1. Create the local configuration file. If `.env` already exists, edit that file.
 
    ```bash
    cp .env.example .env
    ```
 
-   Change the example PostgreSQL password before using the stack. Keep `POSTGRES_USER`, `POSTGRES_PASSWORD`, and `POSTGRES_DB` aligned with `DATABASE_URL`. Because the migrations use a split layout, add this container path to `.env` for `make stack-up`:
+2. Set a PostgreSQL password in `.env`.
+   Use the same credentials in `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`, and `DATABASE_URL`.
+
+3. Add this migration path to `.env`:
 
    ```dotenv
    MIGRATIONS_PATH=/app/migrations/up
    ```
 
-   Remove or change that override before using the same `.env` with host-run `make run`; the host path is `migrations/up`.
+   The Docker image contains migration files in this directory.
+   The image default points to `/app/migrations`, so this override is necessary.
 
-2. Start the full stack:
+4. Start the stack:
 
    ```bash
    make stack-up
    ```
 
-   This starts PostgreSQL, Redis, the API, Jaeger, Prometheus, Loki, Grafana Alloy, and Grafana. The server applies migrations during startup. The default API address is `http://127.0.0.1:8080`.
+   Compose starts PostgreSQL, Redis, the API, Jaeger, Prometheus, Loki, Grafana Alloy, and Grafana.
+   The API applies database migrations at startup.
 
-   The image contains the split migration layout under `/app/migrations/up`, and the migration path must point to the directory containing the numbered `*.up.sql` files.
-
-3. Check the service:
+5. Check the API:
 
    ```bash
    curl -sS http://127.0.0.1:8080/healthz
    ```
 
-4. Stop the stack when finished:
+   Expected response:
+
+   ```json
+   {"status":"ok"}
+   ```
+
+6. Stop the stack after use:
 
    ```bash
    make stack-down
    ```
 
-For lightweight development, `make up` starts only PostgreSQL and Redis and `make run` starts the API on the host. The server loads `.env` with `godotenv`. Host-run traces can be sent to a collector at `http://127.0.0.1:4318`; Docker services use `http://jaeger:4318`.
+Keep `PORT=8080` for this procedure. The Compose port mapping uses container port `8080`.
 
-### Stack URLs
+### Service addresses
 
-| Service | URL | Notes |
+| Service | Address | Purpose |
 | --- | --- | --- |
-| API | http://127.0.0.1:8080 | Main HTTP server |
+| API | http://127.0.0.1:8080 | Payment requests and health checks |
 | Jaeger | http://127.0.0.1:16686 | Trace search |
 | Prometheus | http://127.0.0.1:9090 | Metrics and queries |
 | Loki | http://127.0.0.1:3100 | Log storage API |
-| Alloy | http://127.0.0.1:12345 | Alloy HTTP/server endpoint |
-| Grafana | http://127.0.0.1:3000 | Default login: `admin` / `admin` |
+| Alloy | http://127.0.0.1:12345 | Collector status |
+| Grafana | http://127.0.0.1:3000 | Dashboards; default login: `admin` / `admin` |
 
-Grafana provisions Prometheus and Loki automatically and loads the **PayFlow** dashboard from `deploy/grafana/dashboards/payflow.json`.
+Grafana loads the Prometheus and Loki data sources automatically.
+It also loads the **PayFlow** dashboard from `deploy/grafana/dashboards/payflow.json`.
+
+## Run the API on the host
+
+1. Create or edit `.env` as described above.
+2. Remove the Docker `MIGRATIONS_PATH` override, or set it to `migrations/up`.
+3. Set the trace endpoint for the host:
+
+   ```dotenv
+   OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318
+   ```
+
+4. Start PostgreSQL and Redis:
+
+   ```bash
+   make up
+   ```
+
+5. Start Jaeger if you need local traces:
+
+   ```bash
+   docker compose up -d jaeger
+   ```
+
+6. Start the API:
+
+   ```bash
+   make run
+   ```
+
+The server loads `.env`. Existing process environment variables take precedence.
+Both PostgreSQL and Redis must respond during startup.
 
 ## Configuration
 
-| Variable | Description |
-| --- | --- |
-| `DATABASE_URL` | Required PostgreSQL DSN. |
-| `REDIS_ADDR` | Redis `host:port`; defaults to `127.0.0.1:6379`. Compose overrides it to `redis:6379`. |
-| `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB` | PostgreSQL Compose service settings. |
-| `TEST_DATABASE_URL` | Separate PostgreSQL DSN used by integration tests. |
-| `PORT` | HTTP listen port; defaults to `8080`. |
-| `MIGRATIONS_PATH` | Directory containing migration files. When unset locally, the server prefers `./migrations/up` when present and otherwise uses `./migrations`. |
-| `IDEMPOTENCY_REQUEST_TIMEOUT` | PostgreSQL idempotency lease duration; defaults to `60s`. Set it longer than the slowest mutating request. |
-| `MERCHANT_WEBHOOK_URLS` | Comma-separated `merchant-uuid=https://endpoint` entries. Invalid entries are ignored. |
-| `DEFAULT_WEBHOOK_URL` | Fallback webhook URL when no merchant-specific URL matches. |
-| `WEBHOOK_SIGNING_SECRET` | Optional shared HMAC-SHA256 secret for webhook signatures. |
-| `WEBHOOK_POLL_INTERVAL` | Outbox worker polling interval; defaults to `5s`. |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP/HTTP trace endpoint; defaults to `jaeger:4318`. |
-| `OTEL_SERVICE_NAME` | OTel `service.name`; defaults to `payflow`. |
-| `OTEL_TRACES_SAMPLER_ARG` | Parent-based trace ID ratio in `[0,1]`; defaults to `1.0`. |
-| `OTEL_SERVICE_VERSION` | Optional OTel service version; defaults to `dev`. |
-| `OTEL_DEPLOYMENT_ENV` | Optional OTel deployment environment; defaults to `dev`. |
-| `LOG_LEVEL` | Zerolog level (`trace` through `disabled`); defaults to `info`. |
-| `GRAFANA_ADMIN_USER`, `GRAFANA_ADMIN_PASSWORD` | Optional Grafana Compose credentials; defaults to `admin` / `admin`. |
+Use [`.env.example`](.env.example) as the configuration reference.
 
-`API_KEY` is present in `.env.example` and the Postman collection, but the current server does not register an API-key authentication middleware. It is therefore not enforced by this implementation.
+| Variable | Purpose and default |
+| --- | --- |
+| `DATABASE_URL` | Required PostgreSQL connection string. |
+| `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB` | Credentials and database name for Compose PostgreSQL. |
+| `REDIS_ADDR` | Redis address. Default: `127.0.0.1:6379`; Compose uses `redis:6379`. |
+| `PORT` | HTTP port. Default: `8080`. |
+| `MIGRATIONS_PATH` | Migration directory. Host default: `migrations/up` when present; otherwise `migrations`. |
+| `TEST_DATABASE_URL` | Connection string for a separate test database. |
+| `IDEMPOTENCY_REQUEST_TIMEOUT` | PostgreSQL request lease duration. Default: `60s`. |
+| `MERCHANT_WEBHOOK_URLS` | Comma-separated `merchant-uuid=https://endpoint` entries. Invalid entries are ignored. |
+| `DEFAULT_WEBHOOK_URL` | Webhook URL when no merchant entry matches. |
+| `WEBHOOK_SIGNING_SECRET` | Optional shared secret for HMAC-SHA256 signatures. |
+| `WEBHOOK_POLL_INTERVAL` | Worker poll interval. Default: `5s`. |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP/HTTP trace endpoint. Default: `jaeger:4318`. |
+| `OTEL_SERVICE_NAME` | Trace service name. Default: `payflow`. |
+| `OTEL_TRACES_SAMPLER_ARG` | Trace sampling ratio from `0` to `1`. Default: `1.0`. |
+| `OTEL_SERVICE_VERSION` | Trace service version. Default: `dev`. |
+| `OTEL_DEPLOYMENT_ENV` | Trace deployment environment. Default: `dev`. |
+| `LOG_LEVEL` | Zerolog level from `trace` to `disabled`. Default: `info`. |
+| `GRAFANA_ADMIN_USER`, `GRAFANA_ADMIN_PASSWORD` | Grafana credentials. Defaults: `admin` / `admin`. |
+
+Set the idempotency lease duration longer than the slowest request that changes data.
+The server does not enforce `API_KEY`, although the example configuration and Postman collection contain it.
 
 ## HTTP API
 
-The API is rooted at `/v1`. Errors use this shape:
+| Method | Path | Result |
+| --- | --- | --- |
+| `POST` | `/v1/payments` | Create and charge a payment. Returns HTTP `201`. |
+| `GET` | `/v1/payments/{id}` | Get a payment. An unknown UUID returns HTTP `404`. |
+| `POST` | `/v1/payments/{id}/refund` | Refund a successful payment. Returns HTTP `200`. |
+| `GET` | `/healthz` | Check PostgreSQL. Returns HTTP `200` or `503`. |
+| `GET` | `/metrics` | Get Prometheus metrics. |
+
+A declined charge can return HTTP `201` with payment status `failed`.
+Always examine the payment status in the response.
+Errors use this structure:
 
 ```json
 {"error":{"code":"VALIDATION_ERROR","message":"..."}}
 ```
 
-| Method | Path | Behavior |
-| --- | --- | --- |
-| `POST` | `/v1/payments` | Create and charge a payment; returns `201`. PSP declines and exhausted PSP failures return a successful HTTP response with `status: "failed"`. |
-| `GET` | `/v1/payments/{id}` | Return persisted payment details; returns `404` for an unknown UUID. |
-| `POST` | `/v1/payments/{id}/refund` | Refund a successful payment and mark it `refunded`; returns `200`. |
-| `GET` | `/healthz` | Ping PostgreSQL; returns `200` with `{"status":"ok"}` or `503` with `DB_UNAVAILABLE`. |
-| `GET` | `/metrics` | Prometheus text exposition endpoint. |
+### Create a payment
 
-### Payment request
-
-`POST /v1/payments` requires `merchant_id`, a positive integer `amount`, a supported `currency`, and a body `idempotency_key`:
-
-```json
-{
-  "merchant_id": "550e8400-e29b-41d4-a716-446655440000",
-  "amount": 100,
-  "currency": "USD",
-  "idempotency_key": "payment-001"
-}
-```
-
-Amounts are integer minor units (for example, cents or paise), must fit in a signed 64-bit integer, and must be sent as JSON numbers rather than strings. The create response is:
-
-```json
-{"payment_id":"<uuid-v7>","status":"success"}
-```
-
-Possible payment statuses are `initiated`, `processing`, `success`, `failed`, and `refunded`. `GET /v1/payments/{id}` serializes `amount` as a decimal string because the domain model uses `big.Int`.
-
-### Refund request
-
-`POST /v1/payments/{id}/refund` requires a positive `amount`, matching `currency`, and a body `idempotency_key`. The payment must be `success`, and the refund amount cannot exceed the original payment amount:
-
-```json
-{
-  "amount": 100,
-  "currency": "USD",
-  "idempotency_key": "refund-001"
-}
-```
-
-The response is `{"refund_id":"<uuid>","status":"success"}`. The associated payment becomes `refunded`.
-
-### curl examples
+Send a merchant UUID, amount, currency, and body idempotency key.
+Use a positive integer amount in minor currency units, such as cents or paise.
+The amount must fit in a signed 64-bit integer. Send a JSON number, not a string.
 
 ```bash
 curl -sS -X POST http://127.0.0.1:8080/v1/payments \
@@ -186,46 +203,117 @@ curl -sS -X POST http://127.0.0.1:8080/v1/payments \
     "currency": "USD",
     "idempotency_key": "payment-001"
   }'
+```
 
-curl -sS http://127.0.0.1:8080/v1/payments/<payment-id>
+Example response:
 
-curl -sS -X POST http://127.0.0.1:8080/v1/payments/<payment-id>/refund \
+```json
+{"payment_id":"<uuid-v7>","status":"success"}
+```
+
+Payment statuses are `initiated`, `processing`, `success`, `failed`, and `refunded`.
+
+### Get a payment
+
+Set `PAYMENT_ID` to the UUID from the create response:
+
+```bash
+PAYMENT_ID='replace-with-payment-uuid'
+curl -sS "http://127.0.0.1:8080/v1/payments/${PAYMENT_ID}"
+```
+
+The response contains the stored payment details.
+This endpoint returns `amount` as a decimal string because the domain model uses `big.Int`.
+
+### Refund a payment
+
+Use a payment with status `success`. Send a positive amount and the original currency.
+The refund amount cannot exceed the original payment amount.
+
+```bash
+curl -sS -X POST "http://127.0.0.1:8080/v1/payments/${PAYMENT_ID}/refund" \
   -H 'Content-Type: application/json' \
   -H 'Idempotency-Key: demo-refund-1' \
   -d '{"amount":100,"currency":"USD","idempotency_key":"refund-001"}'
 ```
 
-### HTTP idempotency
+Example response:
 
-For `POST`, `PUT`, `PATCH`, or `DELETE`, send `Idempotency-Key` (or `X-Idempotency-Key`) to enable response replay. The middleware stores the complete status, headers, and body for 24 hours. Reusing a key with a different method, path, or request body returns `409 Conflict`.
+```json
+{"refund_id":"<uuid>","status":"success"}
+```
 
-Redis is the fast response cache and distributed lock. PostgreSQL stores the completed response and provides a lease fallback when Redis is unavailable. The application still requires a successful Redis ping during startup. Omitting the header bypasses the HTTP middleware, but create and refund bodies still require their own domain `idempotency_key`.
+The transaction inserts the refund record and changes the payment status to `refunded`.
+Even a refund below the original amount changes the entire payment status to `refunded`.
+The HTTP refund service does not call the PSP refund adapter.
+
+### Repeat a request safely
+
+Send `Idempotency-Key` or `X-Idempotency-Key` to enable HTTP response replay.
+This applies to `POST`, `PUT`, `PATCH`, and `DELETE` requests.
+The middleware stores the response status, headers, and body for 24 hours.
+A repeated key with a different method, path, or body returns HTTP `409`.
+
+Redis provides the response cache and distributed lock.
+PostgreSQL stores completed responses and provides a request lease if Redis becomes unavailable.
+Redis must still respond during application startup.
+
+The header key and the body `idempotency_key` have separate purposes.
+The body key is required for payment creation and refunds.
+Without the header, the middleware does not replay HTTP responses.
 
 ## Webhooks
 
-Payment success/failure and refund transitions enqueue a JSON event in `outbox_events` within the same PostgreSQL transaction as the state change. The worker polls every five seconds by default, claims up to 20 events, delivers up to eight concurrently, uses a 10-second HTTP timeout, retries up to 10 attempts with jittered exponential backoff capped at 10 minutes, and marks exhausted events `DEAD`. Stale `PROCESSING` rows are reclaimed after two poll intervals.
+Payment state changes create `payment.success`, `payment.failed`, or `payment.refunded` events.
+The database stores each event in `outbox_events` in the same transaction as the state change.
 
-The worker sends:
+The worker uses these defaults:
+
+| Setting | Value |
+| --- | --- |
+| Poll interval | 5 seconds |
+| Events claimed per batch | 20 |
+| Concurrent deliveries | 8 |
+| HTTP timeout | 10 seconds |
+| Maximum attempts | 10 |
+| Maximum retry delay | 10 minutes |
+| Stale processing threshold | Two poll intervals |
+
+Retry delays increase exponentially and include a random delay.
+The worker marks an event `DEAD` after all delivery attempts fail.
+It also marks an event `DEAD` if no webhook URL is configured.
+
+Each request contains these headers:
 
 - `Content-Type: application/json`
 - `X-PayFlow-Event-Id`
 - `X-PayFlow-Event-Type`
-- `Idempotency-Key` set to the event UUID
-- `X-PayFlow-Signature: sha256=<hex>` when `WEBHOOK_SIGNING_SECRET` is configured
+- `Idempotency-Key`, set to the event UUID
+- `X-PayFlow-Signature: sha256=<hex>`, when a signing secret is configured
 
-The payload is an envelope with `id`, `type`, `created_at`, and `data`. The data includes payment and merchant IDs, amount, currency, status, PSP metadata, and refund metadata for refund events. If no webhook URL is configured, the event is marked dead rather than retried.
+The JSON envelope contains `id`, `type`, `created_at`, and `data`.
+The event data includes payment details and PSP metadata. Refund events also include refund metadata.
 
-For a local receiver:
+To test delivery locally:
 
-```bash
-make webhook-sink
-```
+1. Start the Python receiver:
 
-Use `DEFAULT_WEBHOOK_URL=http://127.0.0.1:9999/webhook` for a host-run API. When the API runs in Compose, use a URL reachable from the container, such as `http://host.docker.internal:9999/webhook` on Docker Desktop, or run a receiver as another Compose service.
+   ```bash
+   make webhook-sink
+   ```
 
-## Observability
+2. Set `DEFAULT_WEBHOOK_URL` in `.env`.
+   For a host API, use `http://127.0.0.1:9999/webhook`.
+   For Docker Desktop, use `http://host.docker.internal:9999/webhook`.
+   Other Docker environments need a receiver address that the API container can reach.
+3. Restart the API with the new configuration.
+4. Create a payment and examine the receiver output.
 
-The API emits zerolog JSON to stdout, exposes `/metrics`, and exports OTel traces with a batch OTLP/HTTP processor. HTTP, service, PSP, database, Redis, and webhook operations are instrumented. Logs include `request_id` and, when a valid trace is active, `trace_id` and `span_id`.
+## Logs, metrics, and traces
+
+The API writes JSON logs to standard output. Logs contain `request_id`.
+Logs also contain `trace_id` and `span_id` when a valid trace is active.
+OpenTelemetry records HTTP, service, PSP, database, Redis, and webhook operations.
 
 ### Prometheus metrics
 
@@ -253,11 +341,12 @@ sum by (psp) (rate(payflow_psp_attempts_total{outcome="retryable_error"}[1m]))
 histogram_quantile(0.95, sum(rate(payflow_webhook_delivery_latency_seconds_bucket[5m])) by (le))
 ```
 
-### Traces and logs
+### Find traces and logs
 
-In Jaeger, select the service configured by `OTEL_SERVICE_NAME` and look for operations such as `payment.create`, `payment.refund`, `psp.charge`, and `webhook.deliver`.
+In Jaeger, select the service named by `OTEL_SERVICE_NAME`.
+Search for `payment.create`, `payment.refund`, `psp.charge`, or `webhook.deliver`.
 
-In Grafana → Explore → Loki, start with:
+In Grafana, open **Explore** and select **Loki**. Use these queries:
 
 ```logql
 {service="app"}
@@ -265,36 +354,83 @@ In Grafana → Explore → Loki, start with:
 {service=~"app|postgres|redis|jaeger|prometheus|loki|alloy|grafana"}
 ```
 
-Grafana Alloy collects Docker logs for the `payflowmock-*` containers and labels them with Compose `service`, Docker `container`, `compose_project`, and `job`. Host-run API logs are not collected by Alloy.
+Grafana Alloy collects logs from the `payflowmock-*` Docker containers.
+Labels include `service`, `container`, `compose_project`, and `job`.
+Alloy does not collect host API logs.
 
-## Make targets
+## Build and test
+
+Build the host binary:
+
+```bash
+make build
+```
+
+The output file is `bin/server`.
+Docker builds use `vendor/` for Go dependencies. Run `make vendor` after dependency changes.
+Optional build certificates go in `deploy/docker/extra-ca/` as `*.crt` files.
+
+Run unit tests without database or Redis integration paths:
+
+```bash
+make test-unit
+```
+
+For integration tests, create a separate PostgreSQL database.
+Set `TEST_DATABASE_URL` in `.env` to that database.
+Tests apply migrations and clear application tables. Never use the development database for these tests.
+Remove the Docker migration path override before host tests.
+Start Redis for integration tests that exercise Redis idempotency.
+
+```bash
+make up
+make test-integration
+make test-week3-integration
+```
+
+`make test-integration` covers repository, handler, and middleware integration tests.
+`make test-week3-integration` covers the webhook worker.
+Tests that require `TEST_DATABASE_URL` are skipped when the variable is unset.
+
+Run all tests, including integration tests, with:
+
+```bash
+make test
+```
+
+The test targets above enable the Go race detector.
+
+### Other Make targets
 
 Run `make help` for the complete list.
 
 | Target | Purpose |
 | --- | --- |
-| `stack-up` / `stack-down` | Build/start or stop the full Compose stack. |
-| `up` / `down` | Start or stop only PostgreSQL and Redis. |
-| `run` | Run `./cmd/server` on the host. |
-| `logs` | Follow Compose logs; use `SERVICES="app grafana"` to scope them. |
-| `docker-build` | Build the app image using vendored modules. |
-| `vendor` | Refresh `vendor/` after dependency changes. |
-| `build` / `clean` | Build `bin/server` or remove `bin/`. |
-| `test` | Run the full race-enabled test suite. |
-| `test-unit` | Run race-enabled short tests; skips database/Redis integration paths. |
-| `test-integration` | Run repository, handler, and middleware integration tests. |
-| `test-week2-unit` / `test-week2-integration` | Retry, PSP, service, and idempotency test subsets. |
-| `test-week3-unit` / `test-week3-integration` | Domain/merchant and webhook worker test subsets. |
-| `migrate-up` / `migrate-down` | Apply or roll back migrations using the `migrate` CLI. |
-| `webhook-sink` | Start the local Python webhook receiver on port `9999` (override `WEBHOOK_SINK_PORT`). |
+| `stack-up` / `stack-down` | Build and start, or stop, the full Compose stack. |
+| `up` | Start PostgreSQL and Redis. |
+| `down` | Stop and remove the Compose stack containers. |
+| `postgres-up` / `postgres-down` | Start or stop PostgreSQL. |
+| `redis-up` / `redis-down` | Start or stop Redis. |
+| `logs` | Read Compose logs. Use `SERVICES="app grafana"` to select services. |
+| `docker-build` | Build the application image. |
+| `vendor` | Update vendored Go dependencies. |
+| `run` | Run the API on the host. |
+| `clean` | Remove `bin/`. |
+| `test-week2-unit` | Test retry, PSP, and service packages without integration paths. |
+| `test-week2-integration` | Test idempotency middleware with PostgreSQL and Redis. |
+| `test-week3-unit` | Test merchant and domain packages without integration paths. |
+| `migrate-up` / `migrate-down` | Apply migrations or roll back one migration with the `migrate` CLI. |
+| `install-migrate` | Install the PostgreSQL-enabled migration CLI. |
+| `webhook-sink` | Start the Python webhook receiver. Default port: `9999`. |
 
-Integration tests use `TEST_DATABASE_URL`, load `.env` when present, and may require the local Redis service for idempotency paths. Keep the test database separate from the development database.
-
-The Docker build uses `vendor/` to avoid dependency downloads during image builds. Run `make vendor` after changing `go.mod`. Optional build-time certificates can be placed as `*.crt` files in `deploy/docker/extra-ca/`.
+Set `WEBHOOK_SINK_PORT` to change the receiver port.
 
 ## Postman collection
 
-Import [`postman/PayFlowMock.postman_collection.json`](postman/PayFlowMock.postman_collection.json) to exercise health, metrics, USD and INR payments, retrieval, refunds, validation errors, idempotency replay, and sample webhook envelopes. The collection stores the created `payment_id` and generated `refund_id` in collection variables.
+Import [PayFlowMock.postman_collection.json](postman/PayFlowMock.postman_collection.json) into Postman.
+The collection contains health checks, metrics, payments, refunds, validation cases, and idempotency replay requests.
+It stores created payment and refund IDs in collection variables.
+It also contains example webhook envelopes.
 
 ## Project layout
 
@@ -312,8 +448,9 @@ Import [`postman/PayFlowMock.postman_collection.json`](postman/PayFlowMock.postm
 - `scripts/webhook_sink.py` — local webhook receiver.
 - `Dockerfile`, `docker-compose.yml`, `Makefile` — build, stack, and development workflows.
 
-## Known implementation boundaries
+## Current limits
 
-- PSP mocks use in-code default configurations with no artificial latency or failure rate; changing those scenarios currently requires code/test configuration.
-- The current HTTP server has no authentication middleware, so `API_KEY` is documentation/configuration scaffolding only.
-- Refund HTTP flows do not call the PSP refund adapter yet; they update the local payment/refund records and emit the refund webhook event.
+- The HTTP server has no authentication middleware. It does not enforce `API_KEY`.
+- Refund requests update local records and create events. They do not call a PSP refund method.
+- A partial refund sets the payment status to `refunded`. Further refunds require the payment status to be `success`.
+- The default PSP mocks have no artificial delay or failure rate. Change code or test configuration to simulate these conditions.
